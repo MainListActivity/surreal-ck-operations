@@ -312,16 +312,6 @@ export function company(): Promise<Company> {
       // 本机公司工具的 company_landscape：与 `sck owner landscape.get` 同一条 ownerApi 路径（只读公司库会话）。
       landscape: async (args) => ownerApi({ db } as never, { command: 'landscape.get', input: args }, 'agent-tool') as Promise<unknown>,
       runDir,
-      // SYS04: the plugin host bundles the server code and evaluates it without a module loader, so the
-      // diagnostic cannot read its own directory from `__dirname`/`import.meta`. The host's own registry
-      // (`paseo plugin ls --json`, the same query the release receipt uses) names the registered source
-      // tree, which the diagnostic then binds by content hash. Read-only; resolved only after core
-      // authorises the caller.
-      pluginSource: async () => {
-        const rows = (await paseo.plugins?.()) ?? [];
-        const row = rows.find(item => item.id === "sck-company");
-        return row?.installation?.identity?.path ?? row?.path ?? null;
-      },
       log: message => console.log(message),
     });
     const messages = new OutboundMessageStore(db.db);

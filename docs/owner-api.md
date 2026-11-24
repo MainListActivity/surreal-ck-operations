@@ -63,8 +63,6 @@
 | 新建/修改编制 | `sck owner def.ensure '{"id":"eng-1","role":"engineering","provider":"codex","model":"auto:sol"}'` |
 | 停用编制 | `sck owner def.disable '{"id":"eng-1","reason":"缩编"}'` |
 | 启用编制 | `sck owner def.enable '{"id":"eng-1"}'` |
-| 待批权限 | `sck owner permission.list '{}'` |
-| 回答权限 | `sck owner permission.answer '{"agentId":"a1","requestId":"r1","behavior":"allow"}'` |
 | 任务附件 | `sck owner task.attachments '{"taskId":"t1"}'` |
 | 附件链接 | `sck owner attachment.url '{"taskId":"t1","file":"report.md"}'` |
 | 审计 | `sck owner audit.list '{}'` |

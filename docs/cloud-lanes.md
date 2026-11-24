@@ -26,9 +26,9 @@
 {
   "commands": {
     "codex": ["/绝对路径/service/sandbox/launch.sh", "/绝对路径/codex"],
-    "codex-cloud": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/server/vendor/src/runner/cloud-lane/main.ts", "codex-cloud"],
-    "devin-cloud": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/server/vendor/src/runner/cloud-lane/main.ts", "devin-cloud"],
-    "jules": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/server/vendor/src/runner/cloud-lane/main.ts", "jules"]
+    "codex-cloud": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/src/runner/cloud-lane/main.ts", "codex-cloud"],
+    "devin-cloud": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/src/runner/cloud-lane/main.ts", "devin-cloud"],
+    "jules": ["/绝对路径/service/sandbox/launch.sh", "/Users/y/.bun/bin/bun", "/绝对路径/service/current/src/runner/cloud-lane/main.ts", "jules"]
   },
   "models": { "codex-cloud": ["default"], "devin-cloud": ["default"], "jules": ["default"] },
   "lanes": {
@@ -89,7 +89,7 @@
 
 云端通道之外，公司还可以这样补充员工：
 
-- **Warp（provider `warp`）**：Warp Build 的 oz agent 走原生执行端的本地桥接进程（`src/runner/warp/main.ts`），事件流与云端通道相同。配置步骤：在 `runtime-routes.json` 把 `warp` 路由到本节点（`"warp": "native:<节点ID>"`），在 `native-runner.json` 的 `commands` 加 `"warp": ["<服务>/sandbox/launch.sh", "<bun 绝对路径>", "<服务>/current/server/vendor/src/runner/warp/main.ts", "warp"]`，并按需加 `lanes.warp`：`{"bin": {"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}, "maxMinutes": 120}`。每轮 prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），oz 参数只带文件路径；有 claim 任务工作树就用它，否则用会话 cwd（本地 agent 与普通员工同规则，公司提交由 agent 自己在任务分支完成）。Warp 没有可读额度端点，额度保持 unknown。
+- **Warp（provider `warp`）**：Warp Build 的 oz agent 走原生执行端的本地桥接进程（`src/runner/warp/main.ts`），事件流与云端通道相同。配置步骤：在 `runtime-routes.json` 把 `warp` 路由到本节点（`"warp": "native:<节点ID>"`），在 `native-runner.json` 的 `commands` 加 `"warp": ["<服务>/sandbox/launch.sh", "<bun 绝对路径>", "<服务>/current/src/runner/warp/main.ts", "warp"]`，并按需加 `lanes.warp`：`{"bin": {"oz": "/Applications/Warp.app/Contents/Resources/bin/oz"}, "maxMinutes": 120}`。每轮 prompt 正文写进 commDir 的 `.warp/turn-<时间戳>.md`（0600），oz 参数只带文件路径；有 claim 任务工作树就用它，否则用会话 cwd（本地 agent 与普通员工同规则，公司提交由 agent 自己在任务分支完成）。Warp 没有可读额度端点，额度保持 unknown。
 - **Grok（provider `grok`）**：走 Paseo ACP。`scripts/sandbox/install.sh` 会把 `~/.local/bin/grok` 包进员工沙箱并把 provider command 设为 `[<包装脚本>, "agent", "--always-approve", "stdio"]`（`--always-approve` 是无人值守必需）。升级后需重跑 install.sh。
 - **Muse Code（provider `muse`）**：Paseo 内置 provider。安装并登录后重跑 install.sh，脚本会把包装脚本写进其 command 并启用；未安装则跳过。注意：老板要接的“Muse”是 Meta 的 muse.ai（网页/App 里的通用 agent），不是这个编程 CLI；老板端编制页已不再列出 Muse Code。
 - **Factory 双模式（provider `factory-paseo`）**：与原生 `factory-droid` 并存的 Paseo ACP 入口（同一 droid 包装脚本、`exec --output-format acp-daemon`），install.sh 自动创建。两个 provider id 走同一份订阅：额度窗口、耗尽冷却与「优先订阅」判定都按订阅合并，任一侧耗尽另一侧同步冷却；`preferredProvider` 设任一个，另一个也算优先候选。
@@ -106,7 +106,7 @@ Grok 的 bot（grok.com 左栏 Bots）没有 API，只能在网页或 App 里聊
 - **协议**：建 bot 后先发一条约定消息；之后每轮发 `[SCK-TASK <标记>]` + 内联的 task.md（与复核退回意见），bot 完成后最后一条消息以 `[SCK-DONE <标记>]` 开头给出终稿。标记 = 任务 ID 前 8 位 + 本轮内容摘要：同一轮重启得到同一标记，发送前先查对话里是否已有它，有就只轮询不重发。
 - **判定**：页面主区有 `Working` 状态时视为在忙（发送前也等它空闲，老板正用着就不插话）；连续两次看到「不在 Working 且有同一份终稿」才收稿。bot 停下来出选择题卡片 → 回合按「工作结果：受阻」收尾并带回问题，绝不代答；停下但没给终稿也按受阻收尾。
 - **范围**：bot 读不到本机工作树、没接公司 GitHub，代码改动任务（`intent=code`）直接受阻、不碰浏览器；适合调研、写作、资料整理等文本交付。
-- **配置**：`runtime-routes.json` 加 `"grok-bot": "native:<节点>"`；`native-runner.json` 的 `commands` 加 `"grok-bot": ["<服务>/sandbox/launch.sh", "<bun>", "<服务>/current/server/vendor/src/runner/grok-bot/main.ts", "grok-bot"]`，`models` 加 `"grok-bot": ["<bot UUID>"]`，`lanes["grok-bot"]` 只接受 `bin`（`{"ego-browser": "<绝对路径>"}`）、`maxMinutes`（默认 120）、`pollMs`（默认 20000）。ego-browser 在员工沙箱里可用。没有额度端点，员工定义设 `quotaLimited:false`。
+- **配置**：`runtime-routes.json` 加 `"grok-bot": "native:<节点>"`；`native-runner.json` 的 `commands` 加 `"grok-bot": ["<服务>/sandbox/launch.sh", "<bun>", "<服务>/current/src/runner/grok-bot/main.ts", "grok-bot"]`，`models` 加 `"grok-bot": ["<bot UUID>"]`，`lanes["grok-bot"]` 只接受 `bin`（`{"ego-browser": "<绝对路径>"}`）、`maxMinutes`（默认 120）、`pollMs`（默认 20000）。ego-browser 在员工沙箱里可用。没有额度端点，员工定义设 `quotaLimited:false`。
 - **失败**：grok.com 登录过期 → 错误回合，需要老板在 ego-browser 里重新登录；超时只报错不重发（bot 可能仍在工作，标记写在错误里便于人工核对）。
 - **多个 bot 与专属编制**：每个 bot 一条编制（`model` 填各自 UUID，`maxInstances 1`），`native-runner.json` 的 `models["grok-bot"]` 列出全部 UUID。老板自己的 bot（如「架构师」）接成员工时，编制 `tracks` 设 `["专属:架构师"]`：它只接 `discipline` 为「专属:架构师」的任务，公司专用 bot 和其它同岗编制也不会接这类任务。点名派给它的任务用 `discipline: "专属:架构师"`，审阅者用 owner 或其它岗位。bot 在为老板干活（Working）时通道等它空闲再发；确认发出后 commDir 的 `.webchat/<标记>.json` 记 `sent`，重启只等终稿不重发。
 - **muse.ai（`muse-web`）**：同一个桥接进程（`src/runner/grok-bot/main.ts muse-web`），同一套标记协议。区别：Muse 的主对话是老板私人的，公司任务**每轮新建一个侧聊**（左栏 Side chats 的「New side chat」），侧聊地址写进 commDir 的 `.webchat/<标记>.json`；重试与重启回到同一侧聊，不另开新侧聊重复发送。工作中判定为「Stop task」按钮或「is working / typing」状态。`model` 用 `default`，`maxInstances` 可大于 1（侧聊互相独立）。Muse 在发邮件、付款等动作前会向老板要批准，这类停顿按受阻收尾。配置与 grok-bot 相同，只把 provider 换成 `muse-web`、`models` 写 `["default"]`。

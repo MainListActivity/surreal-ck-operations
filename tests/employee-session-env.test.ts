@@ -2,37 +2,12 @@ import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {expect, test} from 'bun:test';
-import {employeeSessionLookup} from '../plugin/server/employee-session.ts';
-import {employeeModelEnv} from '../plugin/server/model-env.ts';
+import {employeeModelEnv} from '../src/runner/model-env.ts';
 import {
   employeeEnv, readMagpieKey, restoreLegacyRoutingSettings, writeEmployeeSettings,
 } from '../src/model-routing/employee-env.ts';
 import { MAGPIE_BASE, groupModel, isGroupModel, sessionKey } from '../src/model-routing/magpie-contract.ts';
 import {managedModel} from '../src/model-routing/policy.ts';
-
-test('registry identity is stable across model names; outages are never a negative', async () => {
-  let calls=0, unavailable=false;
-  const lookup=employeeSessionLookup(async id=>{calls++;if(unavailable)throw Error('offline');return id==='employee';});
-  expect(await lookup('employee')).toBe(true);
-  unavailable=true;
-  expect(await lookup('employee')).toBe(true);
-  await expect(lookup('manual')).rejects.toThrow('offline');
-  unavailable=false;
-  expect(await lookup('manual')).toBe(false);
-  expect(calls).toBe(3);
-});
-
-test('employee identity survives plugin restart without trusting a lookalike title or model', async () => {
-  const dir=mkdtempSync(join(tmpdir(),'sck-employee-identity-'));
-  try {
-    const file=join(dir,'registry.json');
-    const first=employeeSessionLookup(async()=>false,file);
-    first.remember('company-agent');
-    const restored=employeeSessionLookup(async()=>{throw Error('database unavailable');},file);
-    expect(await restored('company-agent')).toBe(true);
-    await expect(restored('manual-agent')).rejects.toThrow('unavailable');
-  } finally {rmSync(dir,{recursive:true,force:true});}
-});
 
 test('each tier maps to its magpie group; owner-only fable clamps to the role tier', () => {
   expect(groupModel('opus', 'owner')).toBe('group/sck-opus');
@@ -158,7 +133,7 @@ test('story-author keeps its configured model and its legacy routing values are 
   } finally {rmSync(comm,{recursive:true,force:true});rmSync(home,{recursive:true,force:true});}
 });
 
-test('a session the plugin never registered is refused; other providers are left alone', () => {
+test('a session the runner never registered is refused; other providers are left alone', () => {
   const home=mkdtempSync(join(tmpdir(),'sck-model-env-unknown-'));
   try {
     const none={sessionOf:()=>undefined};

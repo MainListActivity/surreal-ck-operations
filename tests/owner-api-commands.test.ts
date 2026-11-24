@@ -6,7 +6,7 @@ import { RecordId } from 'surrealdb';
 import { ownerApi, RUNNER_ONLY_COMMANDS, type OwnerApiContext } from '../src/owner-api.ts';
 import { installHost } from '../src/host-io.ts';
 import { installNodeHost } from '../src/host-node.ts';
-import { pluginOwnerCommand } from '../plugin/server/owner-api.ts';
+import { hostOwnerCommand } from '../src/runner/owner-http.ts';
 
 function makeFakeCtx(overrides?: Partial<OwnerApiContext>) {
   const queries: Array<{ sql: string; params?: any }> = [];
@@ -220,9 +220,9 @@ test('docs/owner-api.md and both owner API layers stay in sync with zero duplica
   const srcContent = readFileSync(join(import.meta.dir, '../src/owner-api.ts'), 'utf8');
   const srcCmds = [...srcContent.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
 
-  // Plugin-only commands live in the plugin wrapper; the docs must cover both layers.
-  const pluginContent = readFileSync(join(import.meta.dir, '../plugin/server/owner-api.ts'), 'utf8');
-  const pluginCmds = [...pluginContent.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
+  // Host commands live in the runner's owner HTTP layer; the docs must cover both layers.
+  const hostContent = readFileSync(join(import.meta.dir, '../src/runner/owner-http.ts'), 'utf8');
+  const pluginCmds = [...hostContent.matchAll(/case\s+'([^']+)'\s*:/g)].map(m => m[1]);
 
   // No duplicate rows in documentation
   const docSet = new Set(docCmds);
@@ -233,68 +233,28 @@ test('docs/owner-api.md and both owner API layers stay in sync with zero duplica
   expect([...docSet].sort()).toEqual([...codeSet].sort());
 });
 
-// ---- ITEM 5: Plugin-only owner commands ----
-function fakeCompany(overrides: Record<string, unknown> = {}) {
-  const queries: Array<{ sql: string; params?: any }> = [];
-  return {
-    company: {
-      db: { db: { query: async (sql: string, params?: any) => { queries.push({ sql, params }); return [[]]; }, select: async () => undefined } },
-      paseo: undefined,
-      ...overrides,
-    } as never,
-    queries,
-  };
-}
-const home = () => mkdtempSync(join(tmpdir(), 'owner-plugin-'));
+// ---- ITEM 5: Runner-hosted owner commands ----
+const fakeCompany = () => ({ db: { db: { query: async () => [[]], select: async () => undefined } } }) as never;
+const home = () => mkdtempSync(join(tmpdir(), 'owner-host-'));
 
-test('plugin permission.list reads the fake paseo and filters company agents', async () => {
-  const refreshed: string[] = [];
-  const paseo = {
-    agents: {
-      list: async () => ({ entries: [
-        { id: 'a1', title: 'QA', labels: { company: 'surreal-ck', employee_id: 'e1', role: 'qa' }, pendingPermissions: [{ id: 'r1' }] },
-        { id: 'a2', title: 'Other', labels: { company: 'someone-else' }, pendingPermissions: [{ id: 'r9' }] },
-      ] }),
-      ref: (id: string) => ({ refresh: async () => { refreshed.push(id); return { pendingPermissions: [{ id: 'r2', kind: 'shell', summary: 'run tests', detail: 'x' }] }; } }),
-    },
-  };
-  const { company } = fakeCompany({ paseo });
-  const result = await pluginOwnerCommand(company, home(), { command: 'permission.list' });
-  expect(result.handled).toBe(true);
-  if (result.handled) {
-    expect((result.value as any).items).toEqual([{ agentId: 'a1', title: 'QA', employeeId: 'e1', role: 'qa',
-      request: { id: 'r2', kind: 'shell', summary: 'run tests', detail: 'x' } }]);
-  }
-  expect(refreshed).toEqual(['a1']);
-});
-
-test('plugin permission.answer validates behavior and responds on the fake paseo', async () => {
-  const answers: any[] = [];
-  const paseo = { agents: { ref: (id: string) => ({ respondToPermission: async (input: unknown) => { answers.push({ id, input }); } }) } };
-  const { company } = fakeCompany({ paseo });
-  const result = await pluginOwnerCommand(company, home(), { command: 'permission.answer', agentId: 'a1', requestId: 'r1', behavior: 'allow', message: 'ok' });
-  expect(result).toEqual({ handled: true, value: { ok: true } });
-  expect(answers).toEqual([{ id: 'a1', input: { requestId: 'r1', response: { behavior: 'allow', message: 'ok' } } }]);
-  await expect(pluginOwnerCommand(company, home(), { command: 'permission.answer', agentId: 'a1', requestId: 'r1', behavior: 'maybe' })).rejects.toThrow(/invalid/);
-  await expect(pluginOwnerCommand(fakeCompany().company, home(), { command: 'permission.list' })).rejects.toThrow(/temporarily_unavailable/);
-});
-
-test('plugin task.attachments lists the evidence dir and attachment.url builds the LAN URL', async () => {
+test('host task.attachments lists the evidence dir and attachment.url builds the LAN URL', async () => {
   const serviceHome = home();
   mkdirSync(join(serviceHome, 'evidence', 't1'), { recursive: true });
   writeFileSync(join(serviceHome, 'evidence', 't1', 'report.md'), '# report');
-  const listed = await pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'task.attachments', taskId: 't1' });
+  const command = hostOwnerCommand(serviceHome);
+  const listed = await command(fakeCompany(), { command: 'task.attachments', taskId: 't1' });
   expect(listed.handled).toBe(true);
   if (listed.handled) expect((listed.value as any).attachments.map((a: any) => a.relPath)).toEqual(['report.md']);
-  const url = await pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'attachment.url', taskId: 't1', file: 'report.md' });
+  const url = await command(fakeCompany(), { command: 'attachment.url', taskId: 't1', file: 'report.md' });
   expect(url.handled).toBe(true);
   if (url.handled) expect((url.value as any).url).toEndWith('/e/t1/report.md');
-  await expect(pluginOwnerCommand(fakeCompany().company, serviceHome, { command: 'attachment.url', taskId: 't1', file: '../x' })).rejects.toThrow(/附件不存在或越界/);
+  await expect(command(fakeCompany(), { command: 'attachment.url', taskId: 't1', file: '../x' })).rejects.toThrow(/附件不存在或越界/);
 });
 
-test('plugin wrapper leaves every src command untouched', async () => {
-  const result = await pluginOwnerCommand(fakeCompany().company, home(), { command: 'goal.list' });
-  expect(result).toEqual({ handled: false });
+test('host layer leaves every src command untouched; Paseo permission commands are gone', async () => {
+  const command = hostOwnerCommand(home());
+  expect(await command(fakeCompany(), { command: 'goal.list' })).toEqual({ handled: false });
+  expect(await command(fakeCompany(), { command: 'permission.list' })).toEqual({ handled: false });
 });
 
 // ---- ITEM 5: Token not on the process command line ----

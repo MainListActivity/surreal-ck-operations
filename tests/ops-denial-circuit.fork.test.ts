@@ -7,7 +7,7 @@ import { loadDatabaseConfig } from '../src/config.ts';
 import { SurrealCompanyCore } from '../src/core.ts';
 import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { Workforce } from '../src/workforce.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;
 run('real fork: the third ops refusal blocks exactly the held task and drops its lease', async () => {
  const root=mkdtempSync(join(tmpdir(),'ops-circuit-fork-'));

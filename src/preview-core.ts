@@ -13,7 +13,7 @@ import { Readable } from 'node:stream';
 import { extname, join, resolve, sep } from 'node:path';
 import { networkInterfaces } from 'node:os';
 import { checkPreviewSig, previewSignedPath } from './preview-sign.ts';
-import { previewListCss } from '../plugin/shared/relay-tokens.ts';
+import { previewListCss } from './relay-tokens.ts';
 
 export interface PreviewCoreOptions {
   /** serviceHome：evidence/ 与 deliverables/ 的上级目录。 */

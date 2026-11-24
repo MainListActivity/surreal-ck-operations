@@ -10,8 +10,8 @@ import { DEFAULT_CONFIG, buildSessionHandoff, type EmployeeInst, type EmployeeDe
 import type { CompanyCore, ProviderQuota, TaskView, LeaseProof, WriteScopeHolder } from '../src/contracts.ts';
 import { overlap } from '../src/dispatcher/worktree-registry.ts';
 import type { OwnerDesk } from '../src/owner.ts';
-import type { SidecarDeps } from '../plugin/server/sidecar.ts';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
+import type { SidecarDeps } from '../src/runner/sidecar.ts';
+import { SidecarPool } from '../src/runner/sidecar.ts';
 import { readJsonFile, reqDir, resDir, reportPath, blockerPath } from '../src/comm.ts';
 import type { ArtifactReclaimResult } from '../src/dispatcher/artifact-sweeper.ts';
 import type { HostResources } from '../src/dispatcher/host.ts';

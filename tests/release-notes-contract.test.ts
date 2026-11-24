@@ -9,7 +9,6 @@ const ROOT = join(import.meta.dir, '..');
 
 const notes = JSON.parse(await Bun.file(join(ROOT, 'company-release.json')).text()) as Record<string, unknown>;
 const pkg = JSON.parse(await Bun.file(join(ROOT, 'package.json')).text()) as { version: string };
-const pluginPkg = JSON.parse(await Bun.file(join(ROOT, 'plugin/package.json')).text()) as { version: string };
 
 describe('the release notes are registrable', () => {
   test('company-release.json parses with the schema the upgrade card uses', () => {
@@ -31,9 +30,8 @@ describe('the release notes are registrable', () => {
     expect((notes.rollback as string).length).toBeLessThanOrEqual(400);
   });
 
-  test('the version is the one the packages carry', () => {
+  test('the version is the one the package carries', () => {
     expect(notes.version).toBe(pkg.version);
-    expect(notes.version).toBe(pluginPkg.version);
   });
 
   test('the notes name the schema they add', () => {

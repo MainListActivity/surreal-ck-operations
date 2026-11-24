@@ -1,16 +1,14 @@
 // 本机公司工具：逻辑唯一权威是 src/runner/company-tools.ts 的 runCompanyTool；
-// 传输有两条——Paseo 插件薄壳（plugin/server/company-tools.ts → callForAgent 'company_tool'）
-// 与 `sck mcp`（comm 目录 → sidecar dispatch 'company_tool'）。
-// 三层验证：假 face 测 runCompanyTool 的绑定/校验/转发形状；真 SidecarPool（journal 托管
+// 传输是 `sck mcp`（comm 目录 → sidecar dispatch 'company_tool'）。
+// 两层验证：假 face 测 runCompanyTool 的绑定/校验/转发形状；真 SidecarPool（journal 托管
 // 生命周期模式）测经 'company_tool' 的 submit/review/report_blocker 真落 result.json 且能被
-// workResult 解析；插件薄壳只测清单、转发与错误形状。
+// workResult 解析。
 import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { companyAgentTools, type CompanySidecarFace, type LocalAgentToolResult } from '../plugin/server/company-tools.ts';
 import { runCompanyTool, COMPANY_TOOL_SPECS, type CompanyToolFace } from '../src/runner/company-tools.ts';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
+import { SidecarPool } from '../src/runner/sidecar.ts';
 import { commDir } from '../src/comm.ts';
 import { workResult } from '../src/runner/lifecycle.ts';
 import type { ClaimResult, TaskView } from '../src/contracts.ts';
@@ -19,7 +17,6 @@ import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
 type Relay = { tool: string; args: Record<string, unknown> };
 type Lease = { taskId: string; phase: 'doing' | 'review'; leaseExpiresAt?: number };
 
-const ctx = (agentId = 'agent-1') => ({ agent: { id: agentId, provider: 'codex', cwd: '/x' }, paseo: undefined, signal: new AbortController().signal });
 
 // ---- runCompanyTool（假 face）：绑定、校验、内层转发 ----
 
@@ -152,50 +149,6 @@ describe('runCompanyTool：清单、绑定与校验', () => {
   });
 });
 
-// ---- 插件薄壳：清单、agentId 转发、错误形状 ----
-
-/** 假 sidecar：agent-1 视为在岗员工，其他 agentId 一律 forbidden（与 callForAgent 相同形状）。 */
-const fakeSidecar = () => {
-  const calls: Array<{ agentId: string; tool: string; args: Record<string, unknown> }> = [];
-  const face: CompanySidecarFace = {
-    callForAgent: async (agentId, tool, args) => {
-      calls.push({ agentId, tool, args });
-      if (agentId !== 'agent-1') return { ok: false, error: 'forbidden: 该会话不是在岗公司员工' };
-      return { ok: true, data: { echoed: args } };
-    },
-  };
-  return { face, calls };
-};
-const errRes = (res: LocalAgentToolResult) => (res.structuredContent as { error: { code: string; message: string } }).error;
-
-describe('插件薄壳：注入 Paseo 会话的 AgentTool', () => {
-  test('清单恰好 7 个，名字合法；未知 agentId → forbidden', async () => {
-    const tools = companyAgentTools({ sidecar: async () => fakeSidecar().face });
-    expect(tools.map(item => item.name).sort()).toEqual(COMPANY_TOOL_SPECS.map(item => item.name).sort());
-    for (const item of tools) expect(item.name).toMatch(/^[a-z][a-z0-9_]*$/);
-
-    const { face } = fakeSidecar();
-    const res = await companyAgentTools({ sidecar: async () => face }).find(t => t.name === 'task_context')!
-      .execute({ taskId: 'task-9' }, ctx('stranger')) as LocalAgentToolResult;
-    expect(errRes(res).code).toBe('forbidden');
-  });
-
-  test('execute 统一经 company_tool 转发并映射成功/失败形状', async () => {
-    const { face, calls } = fakeSidecar();
-    const tools = companyAgentTools({ sidecar: async () => face });
-    const res = await tools.find(t => t.name === 'task_context')!.execute({ taskId: 'task-9' }, ctx()) as LocalAgentToolResult;
-    expect(res.isError).toBeUndefined();
-    expect(res.structuredContent).toEqual({ echoed: { name: 'task_context', args: { taskId: 'task-9' } } });
-    expect(calls).toEqual([{ agentId: 'agent-1', tool: 'company_tool', args: { name: 'task_context', args: { taskId: 'task-9' } } }]);
-
-    const bad: CompanySidecarFace = { callForAgent: async () => ({ ok: false, error: 'invalid: sha 需要 40 位' }) };
-    const fail = await companyAgentTools({ sidecar: async () => bad }).find(t => t.name === 'task_submit')!
-      .execute({ taskId: 't', summary: 'x'.repeat(30), sha: 'abc' }, ctx()) as LocalAgentToolResult;
-    expect(fail.isError).toBe(true);
-    expect(errRes(fail)).toEqual({ code: 'invalid', message: 'sha 需要 40 位' });
-  });
-});
-
 // ---- 真 SidecarPool（journal 模式）：'company_tool' 端到端落 result.json ----
 
 const taskView = (id: string, state = 'doing'): TaskView => ({
@@ -233,6 +186,7 @@ async function world(state: 'doing' | 'review' = 'doing') {
   };
   return { call, pool, resultJson, taskId: `task-${state}` };
 }
+
 
 describe('真池 company_tool：写工具落 result.json 且被 workResult 解析', () => {
   test('task_submit：summary 落盘；带 pr 时末行 PR；sha 透传', async () => {

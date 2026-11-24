@@ -19,6 +19,7 @@ import { nodeCloud } from '../node-update-sources.ts';
 import { startSelfUpdate } from './self-update.ts';
 import { startPreviewHost, type PreviewHost } from './preview-host.ts';
 import { createOwnerHttp } from './owner-http.ts';
+import { remapLegacyRuntimePaths } from './legacy-layout.ts';
 
 installNodeHost();
 loadServiceEnv();
@@ -34,6 +35,11 @@ const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
   models?: Partial<Record<NativeProvider, string[]>>;
   lanes?: Partial<Record<LaneProvider, LaneConfig>>;
 };
+{
+  const { commands, remapped } = remapLegacyRuntimePaths(config.commands ?? {}, serviceHome());
+  config.commands = commands;
+  if (remapped.length) console.log(`原生执行端配置仍写着旧发行布局路径（server/vendor/src），已按 current/src 运行：${remapped.join(', ')}；请更新 native-runner.json`);
+}
 for (const [provider, command] of Object.entries(config.commands ?? {})) {
   if (!['factory-droid', 'claude', 'codex', ...LANE_PROVIDERS].includes(provider) || !Array.isArray(command) || !command.length || command.some(x => typeof x !== 'string') || !isAbsolute(command[0]!)) {
     throw new Error('原生执行端 commands 配置无效；每个命令必须是以绝对路径开头的参数数组');

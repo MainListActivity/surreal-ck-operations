@@ -1,6 +1,6 @@
 # 员工 sidecar 通道架构与运维（v3）
 
-员工会话不持有任何凭证。Paseo 插件 `sck-company` 里每个员工实例对应一个 **sidecar**（`plugin/server/sidecar.ts` 的 `SidecarPool`）：实例凭证、租约证明和续租都留在插件进程内，员工只看到一个会话私有的 **comm 目录** 和一把会话密钥，所有任务服务调用经 `sck call` 由 sidecar 代为执行。需要账号、workspace、生产登录这类凭证能力的 `ops_*` 调用，再由 sidecar 转给同进程的运维代理 `OpsBroker`（`src/ops/broker.ts`）执行。
+员工会话不持有任何凭证。原生执行端里每个员工实例对应一个 **sidecar**（`src/runner/sidecar.ts` 的 `SidecarPool`）：实例凭证、租约证明和续租都留在执行端进程内，员工只看到一个会话私有的 **comm 目录** 和一把会话密钥，所有任务服务调用经 `sck call` 由 sidecar 代为执行。需要账号、workspace、生产登录这类凭证能力的 `ops_*` 调用，再由 sidecar 转给同进程的运维代理 `OpsBroker`（`src/ops/broker.ts`）执行。
 
 ```
 调度器 ──spawn(wake)──▶ Paseo 员工会话（env: SCK_COMM_DIR, SCK_COMM_KEY）
@@ -16,19 +16,19 @@
 
 凭证从铸造到撤销全程不进入员工进程：
 
-- **铸造**：`Workforce.spawnInst` 调 `EnrollmentAdmin.enroll` 生成不透明 token（`sck_<32 字节>`），库中 `employee.credential_digest` 只存其 SHA-256；token 本体只返回给调用方（插件），不落盘、不进环境变量。
+- **铸造**：`Workforce.spawnInst` 调 `EnrollmentAdmin.enroll` 生成不透明 token（`sck_<32 字节>`），库中 `employee.credential_digest` 只存其 SHA-256；token 本体只返回给调用方（执行端），不落盘、不进环境变量。
 - **代持**：sidecar 把 token 放在进程内 `creds` map。员工 spawn 环境只注入 `SCK_COMM_DIR` 和 `SCK_COMM_KEY`（`sidecar.env`）；唤醒已有会话（`paseo send`）不再注入任何环境。
 - **代领**：任务在叫醒员工之前已由调度器调 `sidecar.claim` 以实例凭证领取，`claim.json` 写进 comm 目录作为任务上下文；`claim_next` 在员工侧直接返回 `forbidden`。
 - **续租**：sidecar 每 60s 用持有的凭证调 `core.heartbeat`（`HEARTBEAT_MS`）；员工调 `heartbeat` 是 no-op。
-- **轮换**：插件重启或 `adopt` 重建时内存凭证丢失，`credentialFor` 经 `workforce.rotate` 重签——库中 digest 被换掉，旧 token 立即作废（`retired`/`revoked` 实例在此处失败）。
+- **轮换**：执行端重启或 `adopt` 重建时内存凭证丢失，`credentialFor` 经 `workforce.rotate` 重签——库中 digest 被换掉，旧 token 立即作废（`retired`/`revoked` 实例在此处失败）。
 - **重载恢复**：`adopt` 重签通道后，用 `core.activeLeases` 的完整凭证域查询（不是 `listTasks` 的受限预览/分页）按服务端当前 `taskId`/`deliveryId`/`fence`/`version`/持有人/到期时间重建当前员工的 `doing` 与 `review` 租约，并刷新 `claim.json`；过期、撤销、他人、角色不符、租约歧义或不可读一律 fail closed（不新建 claim、不改作者/实现者、不伪造评审结论）。review 租约的 `report.md` 不是收尾，归档而不 submit；review 仍通过 `review` 或 `report_blocker` 收尾。
 - **撤销**：实例退役或凭证撤销后所有调用 401。0.7.0 已删除凭证文件模式（`SCK_EMPLOYEE_CREDENTIAL_FILE`），员工通道不再有其它凭证来源。
-- **环境清场**：员工进程是 Paseo 守护进程的子进程，会继承其环境。`agent.session_open` 钩子（`plugin/server/scrub.ts`）把继承来的基础设施凭证变量清空（`CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV`、服务端预览签名密钥 `SCK_PREVIEW_SECRET` 等，`SCK_SCRUB_ENV` 可加名），并把公司员工会话的 `ZDOTDIR` 指向垫片目录，使交互式 zsh 重读启动文件后再 `unset` 同名变量；垫片每读完一个启动文件就剥离一次，并把 `ZDOTDIR` 导回垫片，用户启动文件改写 `ZDOTDIR` 也不会绕过。provider 登录变量（`OPENAI_API_KEY` 等）、`SSH_AUTH_SOCK`、`gh` 登录不动。
-- **边界**：这套机制去掉的是「交到员工手里的凭证」和「继承进员工环境的变量」，不是沙箱——员工与插件、老板命令行跑在同一系统用户下，仍能读同用户可读的文件；越界读取靠协议约束与会话日志留痕。要硬隔离需独立系统用户或容器。详见 [运行手册](agent-operations.md#项目环境与凭证) 的安全边界段。
+- **环境清场**：员工进程是执行端的子进程。执行端启动员工时（`src/runner/native-env.ts` 的 `nativeEmployeeEnv` 与 `src/runner/launch-env.ts`）把继承来的基础设施凭证变量清空（`CLOUDFLARE_*`、`CF_API_*`、`SURREAL*`、`JEV_*`、`TYPESAFE_*`、`SCK_OPS_*`、`SCK_PRODUCT_ENV`、服务端预览签名密钥 `SCK_PREVIEW_SECRET` 等，`SCK_SCRUB_ENV` 可加名），并把公司员工会话的 `ZDOTDIR` 指向垫片目录，使交互式 zsh 重读启动文件后再 `unset` 同名变量；垫片每读完一个启动文件就剥离一次，并把 `ZDOTDIR` 导回垫片，用户启动文件改写 `ZDOTDIR` 也不会绕过。provider 登录变量（`OPENAI_API_KEY` 等）、`SSH_AUTH_SOCK`、`gh` 登录不动。
+- **边界**：这套机制去掉的是「交到员工手里的凭证」和「继承进员工环境的变量」，不是沙箱——员工与执行端、老板命令行跑在同一系统用户下，仍能读同用户可读的文件；越界读取靠协议约束与会话日志留痕。要硬隔离需独立系统用户或容器。详见 [运行手册](agent-operations.md#项目环境与凭证) 的安全边界段。
 
 ## comm 文件协议
 
-每个实例一个目录：`$SCK_COMM_DIR` = `<服务目录>/comm/<员工编号>/`（根可用 `SCK_COMM_ROOT` 覆盖），插件启动时 `ensureCommDirs` 建出 0700 的 `req/`、`res/`。
+每个实例一个目录：`$SCK_COMM_DIR` = `<服务目录>/comm/<员工编号>/`（根可用 `SCK_COMM_ROOT` 覆盖），执行端启动时 `ensureCommDirs` 建出 0700 的 `req/`、`res/`。
 
 | 文件 | 写者 | 含义 |
 |---|---|---|
@@ -39,7 +39,7 @@
 | `report.md` | 员工 | 交付说明；回合结束（`agent.turn_ended`）时 sidecar 将其内容作为 submit 证据提交 |
 | `blocker.md` | 员工 | 阻塞说明；同上时机作为 `report_blocker`（固定 to=owner）提交，优先级高于 report.md。订阅额度/限流阻塞时**首行**写 `quotaResetsAt: <ISO 8601 带偏移>`，等价于 `report_blocker` 的 `quotaResetsAt` |
 
-调用路径：员工执行 `sck call <tool> '<json>'`（`bin/sck` → `current/server/vendor/src/sck-cli.ts`）→ 存在 `SCK_COMM_DIR` 时进入 comm 模式：原子写 `req/<时间戳>-<随机>.json`（`writeFileAtomic`，先写 `.tmp-<pid>` 再 rename），然后每 200ms 轮询 `res/` 同名文件，读到即把 `data` 同步写完整个 stdout 再退出 0；`ok:false`（远端拒绝）与本地错误（参数非法、缺 `SCK_COMM_KEY`、comm 目录不可写、超时）都在 stdout 输出一行 JSON `{"ok":false,"code":…,"error":…,"retryable":…}`，原因写 stderr，退出 1；默认 120 秒无响应报 `comm_timeout`（媒体等长任务按工具放宽）。`sck list` 等价于 `call __list__`，返回基础工具加当前可用的 `ops_*` 清单。
+调用路径：员工执行 `sck call <tool> '<json>'`（`bin/sck` → `current/src/sck-cli.ts`）→ 存在 `SCK_COMM_DIR` 时进入 comm 模式：原子写 `req/<时间戳>-<随机>.json`（`writeFileAtomic`，先写 `.tmp-<pid>` 再 rename），然后每 200ms 轮询 `res/` 同名文件，读到即把 `data` 同步写完整个 stdout 再退出 0；`ok:false`（远端拒绝）与本地错误（参数非法、缺 `SCK_COMM_KEY`、comm 目录不可写、超时）都在 stdout 输出一行 JSON `{"ok":false,"code":…,"error":…,"retryable":…}`，原因写 stderr，退出 1；默认 120 秒无响应报 `comm_timeout`（媒体等长任务按工具放宽）。`sck list` 等价于 `call __list__`，返回基础工具加当前可用的 `ops_*` 清单。
 
 sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的请求文件立即删除（一次性消费），校验 `key` 与本次 spawn 签发的 `SCK_COMM_KEY` 一致——不一致回 `stale comm key; this session predates a plugin restart`（key 只在本进程内存，插件重启 adopt 后没有可比对的旧 key，该校验自然放开），然后按工具名分发：
 
@@ -50,7 +50,7 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 
 - **管理查询分页与字节预算（SYS01）**：`get_context`、`get_task_history`、`list_worktrees` 的每个响应的整条应答在序列化后不超过 48 KiB（UTF-8 字节，按 `answerBytes` 计，即双份计量加 256 字节帧预留，见 [query-paging.md](./query-paging.md) 第 2 节）。不带 `pageSize`、`cursor` 的旧调用返回完整结果，超出预算则报 `response_too_large`，不返回不完整的列表；`list_worktrees` 旧调用仍为数组。带 `pageSize` 或 `cursor` 时返回一页并附 `page.nextCursor`，游标绑定调用人与查询条件，快照在 6 小时内固定；`list_worktrees` 此时返回 `{ worktrees, page }`。`list_worktrees` 的范围按 R8 处理：非 owner 必须带 `taskId`，缺省或 null 一律 `forbidden`，通道不回退到调用人的当前租约任务；owner 可不带 `taskId` 读取全局库存。定点读取的旧调用在整体装得下时返回完整原文，超出时报 `response_too_large` 并给出 `read_task_text` 入口。长文本全文用 `read_task_text` 按字节段读取，并用 sha256 校验。`get_admin_summary` 为 owner 专用的只读汇总。写接口的回显同样受预算限制：超长正文被截断并标注，写入本身不因回显失败。`reclaim_worktrees` 的参数严格：整包 null，以及 `dryRun`、`repos` 的非法值，一律 `invalid`，不触碰工作树（经理裁定 v44）。完整契约、游标语义与回滚隔离见 [query-paging.md](./query-paging.md)。
 - **应答形态**：`get_task_history` 不带 `pageSize`、`cursor` 时返回 `{ history }`，带分页参数时返回 `{ history, page }`。`get_context` 的旧调用返回 `{ principal, companyIncluded, companyRead, tasks }`：默认不含公司块（`companyIncluded: false`，`companyRead` 给出分页读取的参数）；整包装得下时可传 `includeCompany: true` 取得公司块，否则用 `{"scope":"company","pageSize":25}` 与 `cursor` 分页读取。
-- **快照与容量**：插件 sidecar 的分页快照与其它写快照的进程共用库内配额（`query_snapshot_quota:global`），每身份 4 个、全库 64 个、合计 64 MiB，超出时的行为见 [query-paging.md](./query-paging.md) 第 4 节。sidecar 是独立进程，上限在数据库内强制执行，不因进程数而翻倍。
+- **快照与容量**：执行端 sidecar 的分页快照与其它写快照的进程共用库内配额（`query_snapshot_quota:global`），每身份 4 个、全库 64 个、合计 64 MiB，超出时的行为见 [query-paging.md](./query-paging.md) 第 4 节。sidecar 是独立进程，上限在数据库内强制执行，不因进程数而翻倍。
 - **复核回避**：没有独立策略表——复核候选的唯一排除规则是「先前提交人」：在任务 `submit` 审计里作为 actor 出现的员工不能领该任务的复核；提交事实读不出来时该任务按 `unknown` 等待。claim-only 经手人按 `PRIOR_HAND_WEIGHT_FACTOR` 降权。
 - **身份关联**：`identity_principal_set`（manage 能力）登记 principal，把多个 employeeId 显式绑定为同一个人；这是唯一的跨员工身份键，编制/provider/模型/名字/目录都不是身份。以 `expectedVersion` 做 compare-and-set，任一被登记员工持有未到期租约时拒绝，`reason` 必填并写审计，同一 `idempotencyKey` 同载荷回放原结果；细则见 agent-operations.md「身份关联」。
 
@@ -78,12 +78,12 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 | `ops_product_pulse {session,event,day}` | 只读产品漏斗脉冲：固定 `surreal_ck`/`production` 与 `engineering`/`product`/`qa` 岗位，用运营会话调 `GET /api/ops/funnel-summary`（CK #258），沿用 `funnel.read`；只接受一个已知事件与一个合法 UTC 日。只投影经类型校验的 state、公开聚合数与 coverage；未知字段忽略，事件/日期/计数/覆盖不一致或畸形响应一律拒绝且不回显原文。空窗、低样本抑制、覆盖未知与授权失败分别可辨；不调逐行 `funnel-counts`，不返回会话句柄、工作区标识、原始错误或正文 |
 | `ops_test_fixture_ready {alias, browser?, action?, format?, handle?}` | 仅工程/QA、仅在真实任务租约内可用的测试夹具：按 project/env/task/fence/alias 派生 `TEST_` 账号、测试 workspace 与三条本机合成样本（服务私有目录 `fixtures/<task>/`，只回 `fx_` 句柄），可选 `browser {spaceId,page?}` 注入客户会话。每个有副作用阶段前以及同阶段每次重试前复查活租约与 fence；阶段期限约束 `work()` 本身，超时保留 uncertain、禁止盲重试。返回只有状态、`s_` 会话句柄、`fx_` 样本句柄与脱敏测试标识。本机台账（0600）是认领既有资产的唯一依据：无台账的同名账号/workspace/样本文件不认领、不覆盖、不删除，跨任务/跨员工/跨租约代际直接拒绝复用。`action:"read"` 经授权返回本租约样本内容（json/csv），不暴露本机路径；`action:"reclaim"` 只删本租约代际创建且摘要仍一致的样本并丢弃本夹具会话；账号与 workspace 无受支持删除入口，明确保留 |
 
-- **会话**：仅存内存，按（员工、项目、环境）隔离，每员工最多 8 个、最长 6 小时；token 临过期自动重登。租约结束、会话归档、插件重启即全部失效，跨任务不复用。代理没有删除账号/workspace 的能力。
+- **会话**：仅存内存，按（员工、项目、环境）隔离，每员工最多 8 个、最长 6 小时；token 临过期自动重登。租约结束、会话归档、执行端重启即全部失效，跨任务不复用。代理没有删除账号/workspace 的能力。
 - **配额**：项目内按审计行统计最近 24h 新建数，超限回 `limit_reached`。
 - **审计**：账号创建/修复、workspace 创建/进入、成员增删、登录、浏览器登录写实名 `audit` 行并进交接历史；只读调用与 `ops_request`/`ops_query` 记 `ops_call`，不进交接历史。
 - **脱敏**：返回与审计文本都抹掉 token 字段名、JWT/Bearer/密码形态串，以及该员工全部在存会话 token；上游错误只透出机器码。
 - **错误码**：`invalid`（参数）、`forbidden`（岗位/权限）、`not_configured`（环境未配代理或缺 D1/data/Cloudflare 凭证）、`not_found`、`limit_reached`、`conflict`、`login_failed`、`upstream_error`（超时/断连/5xx，`retryable`）。
-- **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，`sh plugin/scripts/vendor.sh` 后 `plugin reload`；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
+- **扩能**：新能力在 `src/ops/` 实现并登记 `OPS_TOOLS` + 处理表 + 测试，协议表加一行，发版后由执行端自更新上线；通道无需改动。详见 [运行手册](agent-operations.md#运维代理ops-broker)。
 
 ## company_cmd 公司命令
 
@@ -97,13 +97,13 @@ sidecar 侧每 400ms（`SWEEP_MS`）扫一遍活跃实例的 `req/`：读到的�
 
 ## deliverables/ 交付包约定
 
-员工用 `deliverable_publish` 发布给老板看的产物，落点为 `$SCK_SERVICE_HOME/deliverables/<taskId>/`，经插件内嵌预览服务 `/d/<taskId>/…` 路由以 LAN URL 呈现（无鉴权，局域网口径）；`evidence/<taskId>/` 则对应 `/e/` 路由（收件箱附件自动枚举呈现）。证据文本里给老板点开的链接必须来自 `deliverable_publish` 的返回 `urls`，本地路径与 `file://` 不算交付。
+员工用 `deliverable_publish` 发布给老板看的产物，落点为 `$SCK_SERVICE_HOME/deliverables/<taskId>/`，经执行端内的预览服务 `/d/<taskId>/…` 路由以 LAN URL 呈现（无鉴权，局域网口径）；`evidence/<taskId>/` 则对应 `/e/` 路由（收件箱附件自动枚举呈现）。证据文本里给老板点开的链接必须来自 `deliverable_publish` 的返回 `urls`，本地路径与 `file://` 不算交付。
 
 ## 排障
 
-- 员工侧 `sck call` 报 `comm request timed out`：插件未运行或 sidecar 未接管；确认 Paseo 插件已加载（`plugin reload sck-company`）。
-- `stale comm key`：会话环境里的 key 与当前 spawn 不符，一般是插件重启后旧会话仍在写 req；该会话的租约状态以服务端为准。
+- 员工侧 `sck call` 报 `comm request timed out`：执行端未运行或 sidecar 未接管；确认 `org.surrealck.native.<节点ID>` 在运行。
+- `stale comm key`：会话环境里的 key 与当前 spawn 不符，一般是执行端重启后旧会话仍在写 req；该会话的租约状态以服务端为准。
 - `no_lease`：租约已被收回/消耗（提交后、被改派后），先重读 `claim.json` 与任务状态。
-- 插件重载后 `no_lease`：确认服务端 `activeLeases` 能查到该员工仍有效的 `doing`/`review` 租约；若查询为空、过期、被撤销或与本地 `claim.json` 的 delivery 不一致，sidecar 会按 fail closed 处理并归档陈旧 report/blocker。
-- comm 目录残留 `.failed-`/`.orphaned-` 文件：分别是提交失败与无租约残留的交付物归档，看审计与插件日志定因。
-- 插件日志（Paseo 插件进程 stdout）有 `sidecar claimed|submitted|blocked|adopted|releaseClaim`、`scrub <agentId>`、`heartbeat failed` 等行；任务侧看 `audit` 表。
+- 执行端重启后 `no_lease`：确认服务端 `activeLeases` 能查到该员工仍有效的 `doing`/`review` 租约；若查询为空、过期、被撤销或与本地 `claim.json` 的 delivery 不一致，sidecar 会按 fail closed 处理并归档陈旧 report/blocker。
+- comm 目录残留 `.failed-`/`.orphaned-` 文件：分别是提交失败与无租约残留的交付物归档，看审计与执行端日志定因。
+- 执行端日志（`logs/native-<节点ID>.log`）有 `sidecar claimed|submitted|blocked|adopted|releaseClaim`、`scrub <agentId>`、`heartbeat failed` 等行；任务侧看 `audit` 表。

@@ -15,7 +15,7 @@ import type { EmployeeInst } from '../src/workforce.ts';
 import { queryDigest } from '../src/query-input.ts';
 import { RESPONSE_BUDGET_BYTES, answerBytes, guardRelayResponse, sealCursor } from '../src/response-budget.ts';
 import { SnapshotStore } from '../src/snapshot-store.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 
 // SYS01 bounded reads on the isolated company fork started by scripts/test-worktrees.ts. Never production.
 const config = { ...loadDatabaseConfig(), namespace: 'sck_agent_company_test', database: 'control_plane' };

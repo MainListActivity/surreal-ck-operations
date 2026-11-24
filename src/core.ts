@@ -40,8 +40,6 @@ import {
 
 /** The outcome of a fault report, as the core sees it: the classification plus what the budget decided. */
 type FaultReportOutcome = FaultReportResult;
-import type { PluginRuntimeView } from './contracts.ts';
-import { PLUGIN_RUNTIME_ROLES } from './contracts.ts';
 
 import { CompanyError } from './core-errors.ts';
 import { hostIO } from './host-io.ts';
@@ -1712,23 +1710,6 @@ export class SurrealCompanyCore implements CompanyCore {
         taskRows, auditRows, checks, ...(unknownStates.length ? { unknownStates } : {}),
       },
     };
-  }
-
-  /**
-   * owner/product/qa only, read-only (SYS04): what the plugin process is actually running.
-   *
-   * The core cannot take the sample itself — only the plugin host can state which release it loaded, and the
-   * plugin host is the face every employee channel reaches. So the core owns the authorization and the caller
-   * owns the sampling, in that order: `sample` runs only after the caller is known to be allowed, so an
-   * unauthorized read produces no diagnostic at all rather than a refused one that still touched the
-   * filesystem.
-   */
-  async pluginRuntimeDiagnostics(credential: Credential, sample: () => PluginRuntimeView | Promise<PluginRuntimeView>): Promise<PluginRuntimeView> {
-    const actor = await this.authorized(credential);
-    if (!PLUGIN_RUNTIME_ROLES.includes(actor.role)) {
-      throw new CompanyError('forbidden', 'Only owner, product or qa may read the plugin runtime diagnostics');
-    }
-    return await sample();
   }
 
   /**

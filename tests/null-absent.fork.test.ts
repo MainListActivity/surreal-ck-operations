@@ -10,7 +10,7 @@ import { LocalEnrollmentAdmin } from '../src/enrollment.ts';
 import { readJsonFile, reqDir, resDir, writeFileAtomic } from '../src/comm.ts';
 import type { ClaimResult, Credential, TaskView } from '../src/contracts.ts';
 import type { EmployeeInst, SupervisedTask } from '../src/workforce.ts';
-import { SidecarPool } from '../plugin/server/sidecar.ts';
+import { SidecarPool } from '../src/runner/sidecar.ts';
 
 // SYS01 R8 (non-gm list_worktrees without a task is forbidden; the lease never stands in) and null-as-absent, on the
 // isolated company fork started by scripts/test-worktrees.ts. Real core and real sidecar pool.

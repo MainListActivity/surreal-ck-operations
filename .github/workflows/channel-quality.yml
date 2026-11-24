@@ -24,8 +24,5 @@ jobs:
           sudo apt-get install -y zsh
           zsh --version
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --dir plugin install --frozen-lockfile --ignore-scripts
-      - run: sh plugin/scripts/vendor.sh
       - run: pnpm typecheck
-      - run: pnpm --dir plugin typecheck
       - run: pnpm test:channel

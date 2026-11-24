@@ -16,7 +16,7 @@ import { Workforce } from '../src/workforce.ts';
 import type { EmployeeInst } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 import { blockerPath } from '../src/comm.ts';
 
 const run = process.env.RUN_SCK_CHANNEL_FORK_TESTS === '1' ? test : test.skip;

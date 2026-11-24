@@ -11,7 +11,7 @@ import { Workforce } from '../src/workforce.ts';
 import { Dispatcher } from '../src/dispatcher/dispatcher.ts';
 import { BLOCK_TEXT } from '../src/dispatcher/dispatch-blocked.ts';
 import type { PaseoGateway } from '../src/dispatcher/paseo.ts';
-import { SidecarPool, type SidecarDeps } from '../plugin/server/sidecar.ts';
+import { SidecarPool, type SidecarDeps } from '../src/runner/sidecar.ts';
 
 // SYS-DISP review round v44 (B2, B3): dispatch-blocked episodes and unknown states on a real company fork.
 // Every behavioural claim is also read back from the database (owner_notice, task, audit, dispatch rows).

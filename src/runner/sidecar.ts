@@ -29,7 +29,7 @@ import { STEWARD_RELAY_OPS_ALLOWLIST, STEWARD_RELAY_WRITE_OPS, stewardRelayOutbo
 import { clip, redactSecrets } from "../ops/redact.ts";
 import { runCompanyTool, type CompanyToolFace } from "./company-tools.ts";
 
-/** The release the node updater made live (the `current` symlink to plugin-releases/<sha>/plugin); undefined when it cannot be read. */
+/** The release the runner's self-update made live (the `current` symlink to plugin-releases/<sha>/<runtime dir>); undefined when it cannot be read. */
 const qaRuntimeRelease = (): string | undefined => {
   try { return basename(dirname(realpathSync(join(serviceHome(), "current")))); } catch { return undefined; }
 };
@@ -57,9 +57,6 @@ const BASE_TOOLS = [
   "company_cmd", "company_cmd_catalog",
   // SYS01 bounded reads: owner-only company summary and byte-segment reads of long text (core enforces both).
   "get_admin_summary", "read_task_text", "read_worktree_refs", "record_acceptance_evidence", "acceptance_status", "acceptance_gate", "set_acceptance_gate",
-  // SYS04: what the plugin process is actually running. Answered in the plugin host's own context, never from
-  // a client-side tree or the `active` symlink, so it can serve as evidence of the loaded version.
-  "plugin_runtime_diagnostics",
   // Mode 1 云端通道本地工具代跑中继：云端 agent 经此请求本地驻场管理员代跑绿区只读/幂等 ops。
   "steward_lane_assist",
   // MCP-2 云端通道收尾：桥接进程在按下发送前开闸（清旧 mcp_outcome）、轮询时读本租约代际的 MCP 结论。
@@ -212,13 +209,6 @@ export interface SidecarDeps {
   /** Root under which per-instance comm dirs live. */
   runDir: string;
 
-  /**
-   * The registered source directory of this plugin, from the trusted host's own plugin registry
-   * (`paseo plugin ls --json`). The Paseo host evaluates a CJS bundle with no module loader, so the
-   * diagnostic cannot derive its own directory; it binds this registered tree instead. Resolved only
-   * after core authorises the read.
-   */
-  pluginSource?: () => Promise<string | null>;
   log?: (message: string) => void;
   /** Injectable for tests. */
   heartbeatMs?: number;
@@ -1534,36 +1524,6 @@ export class SidecarPool {
           files: Array.isArray(args.files) ? args.files.map(String) : [],
         });
       }
-      // SYS04: a read-only sample of what THIS process is running.
-      //
-      // The sample is taken here, in the plugin host, because a path read in any other process would describe a
-      // different execution context than the one the employee's `sck call` reaches. The
-      // authorization is core's: it decides whether this caller may read the diagnostics at all, and it does so
-      // BEFORE the sample is taken, so an unauthorized read produces no diagnostic at all rather than a refused
-      // one that still touched the filesystem. The role set is owner/product/qa — the operators who act on a
-      // deployment; a general employee has no business collecting the service's runtime fingerprint.
-      case "plugin_runtime_diagnostics": return withinReplyCeiling(async () => {
-        if (this.deps.nativeExecution) throw Object.assign(new Error("当前为原生执行端，没有 Paseo 插件运行态"), { code: "not_configured" });
-        if (!core.pluginRuntimeDiagnostics) {
-          throw Object.assign(new Error("core does not expose plugin_runtime_diagnostics"), { code: "temporarily_unavailable" });
-        }
-        return core.pluginRuntimeDiagnostics(cred, async () => {
-          const { collectPluginRuntimeDiagnostics } = await import("./runtime-diagnostics.ts");
-          // Resolved inside the sample callback so an unauthorised caller (core refuses before sampling)
-          // never triggers a host query. The host evaluates a CJS bundle with no module loader, so the
-          // registered plugin source is the only legitimate directory this context can supply.
-          let pluginSourceDir: string | null = null;
-          try {
-            pluginSourceDir = (await this.deps.pluginSource?.()) ?? null;
-          } catch (error) {
-            this.log(`plugin source lookup failed: ${(error as Error).message}`);
-          }
-          const sample = collectPluginRuntimeDiagnostics(pluginSourceDir ? { pluginSourceDir } : {});
-          // The stamp that marks this answer as coming from the plugin sidecar, so it can be told apart from a read
-          // taken in another process (which has no plugin server directory and would report the binding unavailable).
-          return { ...sample, channel: "plugin-sidecar", instanceId: instId };
-        });
-      });
       case "steward_lane_assist": {
         // 阶段以真实租约为准：调用方提供的 phase 只能与租约一致，不能借参数扩大权限。
         const claim = live();
