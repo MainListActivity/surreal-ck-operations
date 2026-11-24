@@ -6,14 +6,66 @@ import { execFileSync } from 'node:child_process';
 import { serviceHome } from '../src/runner/env.ts';
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
 const xml = (s: string) => s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+/** 执行端入口在运行目录里的相对路径，按顺序取第一个存在的（发行包布局变化时启动脚本不用重装）。 */
+export const RUNNER_ENTRIES = ['server/vendor/src/runner/run.ts', 'src/runner/run.ts'] as const;
+/** 新版本连续这么多次启动都没有确认，启动脚本就把 current 指回旧版本。 */
+export const CONFIRM_ATTEMPTS = 3;
+
+/**
+ * 服务启动脚本。除了导出环境并启动执行端，还负责自更新的兜底回退：src/node-updater.ts 切换 current 前写
+ * updater/pending（第 1 行新运行目录、第 2 行旧运行目录），新版本健康后删除它。标记还在且 current 仍指向新版本时，
+ * 每次启动计一次数；超过 CONFIRM_ATTEMPTS 次就把 current 指回旧版本，由旧版本启动后补记回退。
+ * 这段逻辑不随发行版本更新，坏版本无法破坏自己的回退路径。
+ */
+export function launcherScript(o: {home: string; id: string; config: string; path: string}): string {
+  const entries = RUNNER_ENTRIES.map(entry => `'${entry}'`).join(' ');
+  return `#!/bin/sh
+set -eu
+export SCK_SERVICE_HOME=${quote(o.home)}
+export SCK_RUNNER_ID=${quote(o.id)}
+export SCK_NATIVE_CONFIG=${quote(o.config)}
+export SCK_NATIVE_FOLLOW_CURRENT=1
+export PATH=${quote(o.path)}
+. ${quote(join(o.home,'bin/bun-runtime.sh'))}
+resolve_bun "$SCK_SERVICE_HOME"
+pending="$SCK_SERVICE_HOME/updater/pending"
+if [ -f "$pending" ]; then
+  to=$(sed -n 1p "$pending")
+  from=$(sed -n 2p "$pending")
+  live=$(cd "$SCK_SERVICE_HOME/current" 2>/dev/null && pwd -P || true)
+  want=$(cd "$to" 2>/dev/null && pwd -P || true)
+  if [ -n "$live" ] && [ "$live" = "$want" ]; then
+    n=$(cat "$pending.attempts" 2>/dev/null || echo 0)
+    case "$n" in ''|*[!0-9]*) n=0 ;; esac
+    n=$((n + 1))
+    if [ "$n" -gt ${CONFIRM_ATTEMPTS} ] && [ -n "$from" ] && [ -d "$from" ]; then
+      ln -sfn "$from" "$SCK_SERVICE_HOME/current"
+      printf '%s\n' "$((n - 1))" > "$pending.rolled-back"
+      echo "启动脚本：新版本连续 $((n - 1)) 次启动未确认，current 已指回 $from" >&2
+    else
+      printf '%s\n' "$n" > "$pending.attempts"
+    fi
+  fi
+fi
+for entry in ${entries}; do
+  if [ -f "$SCK_SERVICE_HOME/current/$entry" ]; then
+    cd "$SCK_SERVICE_HOME/current"
+    exec "$BUN" "$SCK_SERVICE_HOME/current/$entry"
+  fi
+done
+echo "启动脚本：$SCK_SERVICE_HOME/current 下没有执行端入口" >&2
+exit 78
+`;
+}
+
 export function installNativeService(options: {home: string; userHome: string; id: string; config: string; platform: string; load: boolean}) {
   const {home, userHome, id, config, platform, load} = options;
   if (!/^[a-zA-Z0-9_-]+$/.test(id) || !isAbsolute(home) || !isAbsolute(config)) throw new Error('需要有效节点 ID 与绝对路径');
   if (!['darwin','linux'].includes(platform)) throw new Error('只支持 macOS 与 Linux 服务');
   const parsed = JSON.parse(readFileSync(config,'utf8'));
   if (!Object.keys(parsed.commands ?? {}).length) throw new Error('配置缺少 commands');
-  for (const path of [join(home,'current/server/vendor/src/runner/run.ts'), join(home,'bin/bun-runtime.sh')])
-    if (!existsSync(path)) throw new Error(`已安装的发行文件缺失：${path}`);
+  if (!RUNNER_ENTRIES.some(entry => existsSync(join(home,'current',entry)))) throw new Error(`已安装的发行文件缺失：${join(home,'current',RUNNER_ENTRIES[0])}`);
+  if (!existsSync(join(home,'bin/bun-runtime.sh'))) throw new Error(`已安装的发行文件缺失：${join(home,'bin/bun-runtime.sh')}`);
   const dir = join(home,'native',id); mkdirSync(dir,{recursive:true,mode:0o700});
   mkdirSync(join(home,'logs'),{recursive:true,mode:0o700});
   // The employee sandbox forbids writes to bin; launchd must never execute an employee-writable file.
@@ -28,7 +80,7 @@ export function installNativeService(options: {home: string; userHome: string; i
     for (const path of Object.values(lane?.bin ?? {})) if (typeof path === 'string' && isAbsolute(path)) binDirs.add(dirname(path));
   const servicePath = [...basePath, ...[...binDirs].filter(dir => !basePath.includes(dir))].join(':');
   const launcher = join(home,'bin',`native-${id}.sh`);
-  writeFileSync(launcher, `#!/bin/sh\nset -eu\nexport SCK_SERVICE_HOME=${quote(home)}\nexport SCK_RUNNER_ID=${quote(id)}\nexport SCK_NATIVE_CONFIG=${quote(config)}\nexport SCK_NATIVE_FOLLOW_CURRENT=1\nexport PATH=${quote(servicePath)}\n. ${quote(join(home,'bin/bun-runtime.sh'))}\nresolve_bun "$SCK_SERVICE_HOME"\ncd "$SCK_SERVICE_HOME/current"\nexec "$BUN" "$SCK_SERVICE_HOME/current/server/vendor/src/runner/run.ts"\n`, {mode:0o700});
+  writeFileSync(launcher, launcherScript({home, id, config, path: servicePath}), {mode:0o700});
   if (platform === 'darwin') {
     const label = `org.surrealck.native.${id}`;
     const parent = join(userHome,'Library/LaunchAgents'); mkdirSync(parent,{recursive:true});

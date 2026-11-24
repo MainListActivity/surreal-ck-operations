@@ -13,13 +13,13 @@
 
 | 路径 | 内容 | 来源 |
 |---|---|---|
-| `current` | 符号链接，指向现役插件目录 `plugin-releases/<sha>/plugin`。员工命令从这里运行。 | 节点更新器（`src/node-updater.ts` 的 `pointCurrent`） |
+| `current` | 符号链接，指向现役运行目录 `plugin-releases/<sha>/plugin`。执行端与员工命令从这里运行。 | 执行端自更新（`src/node-updater.ts` 的 `pointCurrent`）；回退时由启动脚本改写 |
 | `plugin-releases/<sha>/` | `release.json`、`plugin/`（含 node_modules）、`scripts/sck.sh`、`scripts/bun-runtime.sh` | 节点更新器从发行包解压 |
 | `bin/sck` | `scripts/sck.sh` 的副本，权限 700 | 节点更新器（切换成功后） |
 | `bin/bun-runtime.sh` | `scripts/bun-runtime.sh` 的副本，权限 700 | 节点更新器 |
-| `updater/` | `node-updater.js`（600）、`run.sh`（700）、运行锁 `lock`、回退冷却记录 `rolled-back.json` | 节点更新器安装与运行 |
+| `updater/` | 运行锁 `lock`、回退冷却记录 `rolled-back.json`、待确认标记 `pending`（含 `.attempts`/`.rolled-back`）；0.13.84 前的 `node-updater.js`、`run.sh` 已不再使用 | 执行端自更新 |
 | `private/` | `owner-token`（0600，插件启动时生成）、`node-id`、`cloud/`（云端凭证文件）、`company-db.env`（只放云端字段，见「节点组成与首次安装」）、`service.env`（可选，路径与端口配置） | 插件与运维人员 |
-| `logs/` | `node-updater.log`、插件的日志 | 各组件 |
+| `logs/` | `native-<节点ID>.log`（执行端、自更新与预览服务）；旧的 `node-updater.log` 不再写入 | 各组件 |
 | `runtime-bun/` | 可选，服务固定的 Bun 运行时 | 运维人员 |
 
 `sck` 与 `bun-runtime.sh` 解析 Bun 的顺序为：环境变量 `SCK_BUN`，`private/service.env` 中的 `SCK_BUN=` 行，`runtime-bun/bin/bun`，最后是 `~/.bun/bin/bun`。不查找 PATH（见 `scripts/bun-runtime.sh`）。显式指定的 `SCK_BUN` 即使不存在也不会被替换。
@@ -33,15 +33,7 @@
 
 ## 节点组成与首次安装
 
-首次安装顺序：
-
-1. 准备工具：Node.js 22 或以上、`tar`、`pnpm`、已登录的 `gh`，以及 Paseo CLI。
-2. 准备云端凭证文件（只放路径，不复制内容）：`private/cloud/runner-client-secret`（权限 0600）；`COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID` 可作为环境变量设置，也可写入 `private/company-db.env`（只读这些云端字段，文件里的 `SURREAL_*` 不生效）。缺少 `COMPANY_DB_URL` 时节点更新器拒绝运行，插件的公司栈也拒绝启动，两者都不回落到本机库。
-3. 在干净的 main 检出目录执行 `sh scripts/node-updater.sh install`。它下载最新正式 Release 的 `manifest.json` 与 `node-updater.js`，校验后注册定时任务，并立即运行一轮。这一轮会注册并启动插件。
-4. 按 [company-upgrades.md](./company-upgrades.md#首次安装节点更新器) 的验证步骤确认插件状态与 `current` 指向。
-5. 员工沙箱（`sh scripts/sandbox/install.sh`）按下文「员工沙箱」一节手工安装，节点更新器不负责它。
-
-`scripts/node-updater.sh` 支持 `install`、`run`、`status`、`uninstall`。`install` 与 `uninstall` 的细节见 company-upgrades.md。
+节点上常驻的是原生执行端（launchd `org.surrealck.native.<节点ID>`，见 [native-agent-runtime.md](./native-agent-runtime.md)）：派工、员工通道、交付预览与老板接口都在这个进程里，版本由它自己更新（见 [company-upgrades.md](./company-upgrades.md#执行端自更新)）。首次安装见 [company-upgrades.md](./company-upgrades.md#新节点安装)。工具要求：`tar`、`pnpm`、已登录的 `gh`；云端凭证文件只放路径，不复制内容：`private/cloud/runner-client-secret`（权限 0600），`COMPANY_DB_URL`、`IDP_ISSUER`、`RUNNER_CLIENT_ID` 写入 `private/company-db.env`。缺少 `COMPANY_DB_URL` 时执行端拒绝启动，不回落到本机库。
 
 ## 员工命令 `sck`
 
@@ -80,14 +72,14 @@
 |---|---|---|
 | 交付预览与老板接口端口 | `curl -sf http://127.0.0.1:18777/healthz` | `{"ok":true,"port":18777,"uptime":...}`（`src/preview-core.ts`） |
 | 签名面（配置了 `SCK_PREVIEW_SECRET` 时） | `curl -sf http://127.0.0.1:18778/healthz` | 同上 |
-| 插件注册 | `paseo plugin ls sck-company --json` | `status` 为 running，`enabled` 为 true，`path` 指向 `plugin-releases/<sha>/plugin` |
-| 节点更新器 | `sh scripts/node-updater.sh status` | 定时任务已加载，日志最后 40 行 |
+| 执行端服务 | `launchctl print gui/$(id -u)/org.surrealck.native.<节点ID>` | `state = running`；`readlink <服务目录>/current` 指向 `plugin-releases/<sha>/plugin` |
+| 自更新 | `grep '\[自更新\]' <服务目录>/logs/native-<节点ID>.log \| tail` | 近 15 分钟内有一轮结论，`updater/pending` 不长期存在 |
 | 云端节点记录 | 见 company-upgrades.md 的 `node_release` 查询 | `checked_at` 为近期时间 |
-| 预览状态 | 读取 `<服务目录>/preview-status.json` | 插件写入，记录两个监听面的状态 |
+| 预览状态 | 读取 `<服务目录>/preview-status.json` | 执行端绑定端口后写入（`host: native`），记录两个监听面的状态 |
 
-`/healthz` 不鉴权。0.7.0 的插件没有 `/health` 或 `/ready` 路由。
+`/healthz` 不鉴权，没有 `/health` 或 `/ready` 路由。
 
-日志：节点更新器写 `logs/node-updater.log`；插件日志前缀为 `[preview]` 等。排查时先看 `node-updater.log` 的最后一行 `结果: …`。
+日志：执行端写 `logs/native-<节点ID>.log`，预览服务前缀 `[preview]`，自更新前缀 `[自更新]`。
 
 ## 数据库与云端迁移
 
@@ -212,7 +204,7 @@ pnpm run admin reclaim-artifacts <任务ID> --execute   # 只回收指定任务
 
 | 动作 | 命令 | 说明 |
 |---|---|---|
-| 停用节点更新器 | `sh scripts/node-updater.sh uninstall` | 移除定时任务，保留 `plugin-releases`、`updater` 与日志。之后节点不会自动升级。 |
+| 停用自更新 | 在 `private/service.env` 写 `SCK_SELF_UPDATE=0`，再 `launchctl kickstart -k gui/$(id -u)/org.surrealck.native.<节点ID>` | 执行端照常派工，但不再检查新版本。 |
 | 停用插件 | `paseo plugin remove sck-company` | 移除插件注册，插件进程随之停止。节点上不再有派工与员工通道。 |
 | 停用本机库（0.7.0 及更早安装过） | `launchctl bootout gui/$(id -u)/org.surrealck.company-db`、`launchctl bootout gui/$(id -u)/org.surrealck.company-backup`、`launchctl bootout gui/$(id -u)/org.surrealck.company-verify`，再删除 `~/Library/LaunchAgents/` 下的 `org.surrealck.company-db.plist`、`org.surrealck.company-backup.plist`、`org.surrealck.company-verify.plist` | 0.7.1 起仓库没有安装或卸载脚本，只能手工停用。不停用的话，`company-db` 仍在本机运行却无人使用，备份与恢复演练会因入口脚本已删除而失败。`private/db` 数据目录与 R2 备份保留，是否归档由老板决定。 |
 | 停用旧公司 MCP 服务（0.6.x 节点若曾安装） | `launchctl bootout gui/$(id -u)/org.surrealck.company-mcp`，再删除 `~/Library/LaunchAgents/org.surrealck.company-mcp.plist` | 0.7.0 不会自动停用它。它若仍在运行，会继续从旧的 `active` 目录提供旧代码。 |

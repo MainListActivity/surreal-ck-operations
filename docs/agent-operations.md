@@ -13,7 +13,7 @@
 
 公司库只在云端 SurrealDB，节点连接它的方式见 [company-upgrades.md](company-upgrades.md)。`private/company-db.env` 只放云端字段（`COMPANY_DB_URL` 等）；缺少 `COMPANY_DB_URL` 时插件与节点更新器拒绝启动，不回落到本机。产品数据仍在 129，由产品 `.env` 描述。运营流水按 `src/data-retention.ts` 的保留期由插件生命周期清理删除。
 
-服务目录：`~/Library/Application Support/SurrealCKCompany/`，布局与安装见 [节点运维手册](company-service-operations.md)。节点上只有 Paseo 插件 `sck-company`（调度器、员工通道、运维代理与老板接口都在插件里）和节点更新器。节点上的插件版本由节点更新器按 Release 切换（见 [company-upgrades.md](company-upgrades.md)），不要手工 `plugin install` 或 `reload` 来升级。本机调试改了 `plugin/` 或 `src/` 时，可用 `$PASEO_CLI plugin reload sck-company` 重载（不要重启 Paseo 守护进程）；开发树登记会被节点更新器拒绝切换，调试结束后执行 `paseo plugin remove sck-company`，再运行 `sh scripts/node-updater.sh run` 重新登记发行版本；**不要再装 launchd 的 dispatcher**，调度器已在插件内，否则会和插件重复派工。服务依赖本机 Paseo、云端公司库、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
+服务目录：`~/Library/Application Support/SurrealCKCompany/`，布局与安装见 [节点运维手册](company-service-operations.md)。节点上常驻的是原生执行端（launchd `org.surrealck.native.<节点ID>`）：调度器、员工通道、运维代理、交付预览与老板接口都在这个进程里，版本由它自己按 Release 更新（见 [company-upgrades.md](company-upgrades.md)），不要手工改 `current` 来升级。本机调试用 `bun run runner:native`（不设 `SCK_NATIVE_FOLLOW_CURRENT`，不会自更新）。服务依赖云端公司库、网络与 GitHub 登录；Mac 合盖或关机时公司暂停。
 
 ## 老板入口
 

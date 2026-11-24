@@ -1,6 +1,9 @@
-// 节点更新器核心：一轮检查、准备、租约门禁、切换与回退，严格按序执行。
-// 只依赖 node 内置模块与发行清单模块。云端、插件控制、发行源与打包工具全部经 UpdaterDeps 注入，
-// 生产适配在 scripts/node-updater.ts。核心代码不使用 Bun 专有 API（打包目标为 node）。
+// 节点自更新核心：原生执行端自己检查、准备、切换 current，并在新版本启动后确认或回退。
+// 一轮更新：检查 → 准备发行目录 → 空闲与租约门禁 → schema 核验 → 写待确认标记 → 原子切换 current。
+// 切换后由执行端排空退出，服务管理器按新 current 拉起新版本；新版本健康后调用 confirmSwitch 收尾。
+// 新版本起不来时，启动脚本（scripts/native-service.ts 生成）按待确认标记计数，连续失败后把 current 指回旧版本，
+// 旧版本启动时由 settlePending 补记回退。坏版本的代码不参与自己的回退。
+// 只依赖 node 内置模块与发行清单模块；云端、发行源与打包工具经依赖注入，生产适配在 src/node-update-sources.ts。
 import { randomUUID } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -11,21 +14,18 @@ import {
   MANIFEST_ASSET,
   parseReleaseManifest,
   sha256File,
-  UPDATER_ASSET,
   type ReleaseAsset,
   type ReleaseManifest,
 } from './release-manifest.ts';
 
-/** 一轮更新的结果。refused / failed / deferred 都发生在切换之前（failed 的 rolled_back 等除外）。 */
+/** 一轮更新的结果。switched 表示 current 已指向新版本，等待执行端重启后确认。 */
 export type UpdateOutcome =
   | { kind: 'current'; version: string; sha: string }
   | { kind: 'no_release' }
   | { kind: 'deferred'; reason: string }
   | { kind: 'refused'; reason: string }
   | { kind: 'failed'; reason: string }
-  | { kind: 'ok'; version: string; sha: string }
-  | { kind: 'rolled_back'; reason: string; version: string; sha: string }
-  | { kind: 'rollback_failed'; reason: string; version: string; sha: string };
+  | { kind: 'switched'; version: string; sha: string };
 
 export interface ReleaseRef { version: string; sha: string }
 
@@ -35,19 +35,10 @@ export interface ReleaseSource {
   download(tag: string, asset: string, dest: string): Promise<void>;
 }
 
-export interface PluginRegistration { path: string; status: string; enabled: boolean }
-
-export interface PluginControl {
-  /** 无注册返回 undefined。 */
-  registration(): Promise<PluginRegistration | undefined>;
-  remove(): Promise<void>;
-  install(pluginDir: string): Promise<void>;
-}
-
 export interface PackageTools {
   extract(tgzFile: string, destDir: string): Promise<void>;
-  /** pnpm install --prod --frozen-lockfile --ignore-scripts，cwd=pluginDir。 */
-  installProd(pluginDir: string): Promise<void>;
+  /** pnpm install --prod --frozen-lockfile --ignore-scripts，cwd=发行目录里的运行目录。 */
+  installProd(payloadDir: string): Promise<void>;
 }
 
 export interface NodeCloud {
@@ -60,26 +51,28 @@ export interface NodeCloud {
   recordRollback(r: { from: ReleaseRef; to: ReleaseRef; at: Date; reason: string; outcome: 'rolled_back' | 'rollback_failed' }): Promise<void>;
 }
 
-export interface UpdaterDeps {
+/** 收尾与补记只需要服务目录、云端、时钟与日志。 */
+export interface SettleDeps {
   home: string;
-  release: ReleaseSource;
-  plugin: PluginControl;
-  tools: PackageTools;
   cloud: NodeCloud;
   now(): Date;
-  sleep(ms: number): Promise<void>;
   log(line: string): void;
-  /** 切换后等待插件进入 running 的上限，默认 60000 毫秒。 */
-  waitRunningMs?: number;
-  /** 等待期间的轮询间隔，默认 2000 毫秒。 */
-  pollMs?: number;
+}
+
+export interface UpdaterDeps extends SettleDeps {
+  release: ReleaseSource;
+  tools: PackageTools;
+  /** 本执行端没有运行中的会话时为 true；切换只在空闲时发生。 */
+  idle(): Promise<boolean>;
 }
 
 const SHA40 = /^[0-9a-f]{40}$/;
 const SEMVER = /^\d+\.\d+\.\d+$/;
-/** 插件发行目录的根：<服务目录>/plugin-releases/<sha>，内含 release.json、plugin/ 与 scripts/（sck.sh、bun-runtime.sh）。 */
-const PLUGIN_RELEASES = 'plugin-releases';
-/** 现役插件目录的符号链接：<服务目录>/current -> plugin-releases/<sha>/plugin。sck 只从这里运行。 */
+/** 发行目录的根：<服务目录>/plugin-releases/<sha>，内含 release.json、运行目录与 scripts/（sck.sh、bun-runtime.sh）。 */
+const RELEASES = 'plugin-releases';
+/** 发行包内的运行目录名，按顺序取第一个存在的（plugin 是历史名称）。 */
+export const PAYLOAD_DIRS = ['runtime', 'plugin'] as const;
+/** 现役运行目录的符号链接：<服务目录>/current -> plugin-releases/<sha>/<运行目录>。执行端与 sck 只从这里运行。 */
 const CURRENT_LINK = 'current';
 /** 发行包 scripts/ 里需要安装到 <服务目录>/bin/ 的 sck 工具脚本（源文件名 -> 安装名）。 */
 const TOOL_SCRIPTS = [
@@ -87,10 +80,10 @@ const TOOL_SCRIPTS = [
   { from: 'bun-runtime.sh', to: 'bun-runtime.sh' },
 ] as const;
 const LOCK_STALE_MS = 60_000;
-const DEFAULT_WAIT_RUNNING_MS = 60_000;
-const DEFAULT_POLL_MS = 2_000;
-/** 切换后回退过的同一版本，这段时间内不再切换到它，避免每轮都重启插件。 */
+/** 切换后回退过的同一版本，这段时间内不再切换到它，避免每轮都重启执行端。 */
 const RETRY_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+/** 待确认标记：第 1 行新运行目录，第 2 行旧运行目录（可空），第 3 行 JSON 元数据。启动脚本只读前两行。 */
+export const PENDING_FILE = join('updater', 'pending');
 
 /** 切换前的中止（拒绝、失败、暂缓）：由顶层转换成对应的结果。 */
 class StepError extends Error {
@@ -101,8 +94,8 @@ class StepError extends Error {
   }
 }
 
-/** 现役版本：版本取自插件目录的 package.json，sha 取自所在发行目录名。 */
-interface Current { version?: string; sha?: string }
+/** 现役版本：path 为 current 解析后的运行目录；版本取自其中的 package.json，sha 取自所在发行目录名。 */
+interface Current { path?: string; version?: string; sha?: string }
 
 export async function runNodeUpdate(deps: UpdaterDeps): Promise<UpdateOutcome> {
   let acquired: (() => void) | undefined;
@@ -113,7 +106,7 @@ export async function runNodeUpdate(deps: UpdaterDeps): Promise<UpdateOutcome> {
   }
   if (!acquired) return { kind: 'deferred', reason: '另一轮更新正在进行' };
   const unlock = acquired;
-  const staging = join(deps.home, PLUGIN_RELEASES, `.staging-${randomUUID()}`);
+  const staging = join(deps.home, RELEASES, `.staging-${randomUUID()}`);
   try {
     return await runLocked(deps, staging);
   } catch (error) {
@@ -138,10 +131,13 @@ export async function runNodeUpdate(deps: UpdaterDeps): Promise<UpdateOutcome> {
 const LABEL = { refused: '拒绝', failed: '失败', deferred: '暂缓' } as const;
 
 async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutcome> {
-  const { home, release, plugin, tools, cloud, log } = deps;
+  const { home, release, cloud, log } = deps;
 
   // 1. 记录本轮检查时间；写入失败只记日志。
   await checkTime(deps);
+
+  // 上一次切换还没确认（新版本尚未健康启动或回退尚未补记）时不再切换。
+  if (existsSync(join(home, PENDING_FILE))) throw new StepError('deferred', '上一次切换尚未确认');
 
   // 2. 最新正式 Release。
   const tag = await release.latestTag();
@@ -163,29 +159,10 @@ async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutc
   if (tag !== `v${manifest.version}`) {
     throw new StepError('refused', `发行标签 ${tag} 与清单版本 ${manifest.version} 不一致`);
   }
-  if (manifest.package.name === manifest.updater.name) {
-    throw new StepError('refused', '发行清单中发行包与更新器的资产名相同，拒绝使用');
-  }
 
-  // 4. 当前注册与现役版本。
-  const homeReal = realpathSync(home);
-  let reg: PluginRegistration | undefined;
-  try {
-    reg = await plugin.registration();
-  } catch (error) {
-    throw new StepError('failed', `读取插件注册失败：${errorText(error)}`);
-  }
-  if (reg) {
-    const regReal = realOrUndefined(reg.path);
-    if (regReal === undefined) throw new StepError('refused', '插件注册路径不存在或无法解析，未切换');
-    if (!isInside(regReal, homeReal)) throw new StepError('refused', '插件注册在服务目录之外，未切换');
-  }
-  const cur: Current = reg ? currentOf(reg) : {};
-  if (cur.sha === manifest.sha) {
-    if (reg && realOrUndefined(join(home, CURRENT_LINK)) !== realOrUndefined(reg.path)) serveCurrent(home, reg.path, log);
-    await refreshUpdater(deps, tag, manifest, staging);
-    return { kind: 'current', version: cur.version ?? manifest.version, sha: manifest.sha };
-  }
+  // 4. 现役版本：current 必须在服务目录之内。
+  const cur = currentOf(home);
+  if (cur.sha === manifest.sha) return { kind: 'current', version: cur.version ?? manifest.version, sha: manifest.sha };
   if (cur.version !== undefined && compareVersions(manifest.version, cur.version) <= 0) {
     throw new StepError('refused', '清单版本不高于现役版本，不降级');
   }
@@ -194,18 +171,20 @@ async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutc
     throw new StepError('deferred', `版本 ${manifest.version} 上次切换后已回退，24 小时内暂缓重试`);
   }
 
-  // 5. 准备发行目录（幂等）。目标目录已齐全时只重新下载并校验更新器，不重复下载发行包。
-  const target = join(home, PLUGIN_RELEASES, manifest.sha);
-  const targetPlugin = join(target, 'plugin');
-  let updaterFile: string;
-  if (isReusable(target, manifest)) {
-    log(`复用已准备好的发行目录：${manifest.version}`);
-    updaterFile = await fetchVerified(deps, tag, manifest.updater, staging);
-  } else {
-    updaterFile = await prepareRelease(deps, tag, manifest, staging, target);
-  }
+  // 5. 准备发行目录（幂等）。目标目录已齐全时直接复用，不重复下载发行包。
+  const target = join(home, RELEASES, manifest.sha);
+  if (isReusable(target, manifest)) log(`复用已准备好的发行目录：${manifest.version}`);
+  else await prepareRelease(deps, tag, manifest, staging, target);
+  const targetPayload = payloadOf(target)!;
 
-  // 6. 租约门禁：切换前最后一步。
+  // 6. 空闲与租约门禁：切换前最后一步。
+  let idle: boolean;
+  try {
+    idle = await deps.idle();
+  } catch (error) {
+    throw new StepError('deferred', `无法确认执行端是否空闲：${errorText(error)}`);
+  }
+  if (!idle) throw new StepError('deferred', '执行端有运行中的会话，下一轮再切换');
   let leases: number;
   try {
     leases = await cloud.activeLeaseCount();
@@ -222,90 +201,194 @@ async function runLocked(deps: UpdaterDeps, staging: string): Promise<UpdateOutc
     throw new StepError('refused', `云端 schema 不满足 ${manifest.version}，未切换：${errorText(error)}`);
   }
 
-  // 8. 切换。任何一步失败都进入回退。
-  const newRef: ReleaseRef = { version: manifest.version, sha: manifest.sha };
+  // 8. 先写待确认标记再切换：启动脚本凭它判断新版本是否起得来。
+  const to: ReleaseRef = { version: manifest.version, sha: manifest.sha };
+  const from = cur.path !== undefined && cur.version !== undefined && cur.sha !== undefined
+    ? { version: cur.version, sha: cur.sha } : undefined;
+  writePending(home, { toPath: targetPayload, fromPath: from ? cur.path : undefined, to, from, at: deps.now().getTime() });
   try {
-    if (reg) await plugin.remove();
-    await plugin.install(targetPlugin);
-    await waitRunning(deps, targetPlugin);
-    await cloud.verifySchema(manifest.version);
+    pointCurrent(home, targetPayload);
   } catch (error) {
-    return rollback(deps, { reg, cur, target: newRef, reason: errorText(error) });
+    clearPending(home, log);
+    throw new StepError('failed', `切换 current 失败：${errorText(error)}`);
   }
+  log(`已切换到 ${manifest.version}，等待执行端重启后确认`);
+  return { kind: 'switched', version: manifest.version, sha: manifest.sha };
+}
 
-  serveCurrent(home, targetPlugin, log);
+// ---------------------------------------------------------------------------
+// 切换后的收尾：新版本启动时 settlePending，健康后 confirmSwitch。
+
+interface Pending { toPath: string; fromPath?: string; to: ReleaseRef; from?: ReleaseRef; at: number }
+
+export type SettleState =
+  | { kind: 'none' }
+  /** current 指向新版本：等健康后调用 confirmSwitch。 */
+  | { kind: 'confirming'; to: ReleaseRef; from?: ReleaseRef }
+  /** 启动脚本已回退到旧版本，本次补记了回退。 */
+  | { kind: 'rolled_back'; to: ReleaseRef; from: ReleaseRef }
+  /** 标记与 current 对不上（人工改过 current），已清理。 */
+  | { kind: 'stale' };
+
+/** 同步只读：current 是否指向待确认的新版本。执行端启动最早一刻据此装确认看门狗，不连云端。 */
+export function awaitingConfirmation(home: string): boolean {
+  const pending = readPending(home);
+  return pending !== undefined && sameDir(join(home, CURRENT_LINK), pending.toPath);
+}
+
+/** 执行端连上云端后调用一次：识别启动脚本的回退并补记，或报告待确认。 */
+export async function settlePending(deps: SettleDeps): Promise<SettleState> {
+  const { home, cloud, log } = deps;
+  if (!existsSync(join(home, PENDING_FILE))) return { kind: 'none' };
+  const pending = readPending(home);
+  if (pending === undefined) {
+    log('待确认标记损坏，已清理');
+    clearPending(home, log);
+    return { kind: 'stale' };
+  }
+  const link = join(home, CURRENT_LINK);
+  if (sameDir(link, pending.toPath)) return { kind: 'confirming', to: pending.to, from: pending.from };
+  if (pending.fromPath !== undefined && pending.from !== undefined && sameDir(link, pending.fromPath)) {
+    const attempts = readCount(join(home, `${PENDING_FILE}.rolled-back`)) ?? readCount(join(home, `${PENDING_FILE}.attempts`));
+    const reason = `新版本 ${pending.to.version} 未能健康启动${attempts ? `（启动 ${attempts} 次）` : ''}，启动脚本已回退`;
+    await recordRolledBack(deps, pending.to, pending.from, reason);
+    clearPending(home, log);
+    return { kind: 'rolled_back', to: pending.to, from: pending.from };
+  }
+  log('待确认标记与 current 不一致（current 被人工改动），已清理');
+  clearPending(home, log);
+  return { kind: 'stale' };
+}
+
+/**
+ * 新版本健康（已连上云端、派工已启动、首个心跳到达）后调用：核验 schema，安装 sck 工具脚本，
+ * 回收旧发行目录，记录升级成功并清除标记。schema 不满足时自己把 current 指回旧版本，返回 rolled_back，
+ * 调用方随后排空退出。
+ */
+export async function confirmSwitch(deps: SettleDeps): Promise<'confirmed' | 'rolled_back' | 'none'> {
+  const { home, cloud, log } = deps;
+  const pending = readPending(home);
+  if (pending === undefined || !sameDir(join(home, CURRENT_LINK), pending.toPath)) return 'none';
   try {
-    installUpdater(home, updaterFile);
+    await cloud.verifySchema(pending.to.version);
   } catch (error) {
-    log(`节点更新器替换失败，保留旧文件（插件已切换）：${errorText(error)}`);
+    const reason = `新版本 ${pending.to.version} 启动后 schema 核验失败：${errorText(error)}`;
+    if (pending.fromPath === undefined || pending.from === undefined) {
+      log(`${reason}；没有可回退的旧版本`);
+      await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'failed', target: pending.to, at: deps.now(), error: reason }));
+      clearPending(home, log);
+      return 'none';
+    }
+    try {
+      pointCurrent(home, pending.fromPath);
+    } catch (pointError) {
+      const failed = `${reason}；回退也失败：${errorText(pointError)}`;
+      log(failed);
+      await recordSafe(log, '回退记录', () => cloud.recordRollback({ from: pending.to, to: pending.from!, at: deps.now(), reason: failed, outcome: 'rollback_failed' }));
+      await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'rollback_failed', target: pending.to, at: deps.now(), error: failed }));
+      clearPending(home, log);
+      return 'none';
+    }
+    await recordRolledBack(deps, pending.to, pending.from, reason);
+    clearPending(home, log);
+    return 'rolled_back';
+  }
+  try {
+    installToolScripts(home, dirname(pending.toPath), log);
+  } catch (error) {
+    log(`sck 工具脚本安装失败（保留旧文件）：${errorText(error)}`);
   }
   clearRolledBack(home, log);
-  // 10. 回收：只删除旧的发行目录，保留目标与现役旧版本（回退目标）。
-  recycle(home, [manifest.sha, cur.sha], log);
-  await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'ok', target: newRef, at: deps.now() }));
-  log(`升级成功：${manifest.version}`);
-  return { kind: 'ok', version: manifest.version, sha: manifest.sha };
+  recycle(home, [pending.to.sha, pending.from?.sha], log);
+  await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'ok', target: pending.to, at: deps.now() }));
+  clearPending(home, log);
+  log(`升级成功：${pending.to.version}`);
+  return 'confirmed';
 }
 
-/** 切换后失败：回退到原注册路径；无原注册时只尽力停掉新插件。 */
-async function rollback(
-  deps: UpdaterDeps,
-  ctx: { reg?: PluginRegistration; cur: Current; target: ReleaseRef; reason: string },
-): Promise<UpdateOutcome> {
-  const { plugin, cloud, log } = deps;
+async function recordRolledBack(deps: SettleDeps, target: ReleaseRef, back: ReleaseRef, reason: string): Promise<void> {
   const at = deps.now();
-  log(`切换后失败，开始回退：${ctx.reason}`);
-  if (!ctx.reg) {
-    try {
-      await plugin.remove();
-    } catch {
-      // 忽略：新插件可能本就没有注册成功。
-    }
-    await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'failed', target: ctx.target, at, error: ctx.reason }));
-    return { kind: 'failed', reason: ctx.reason };
-  }
-
-  const reg = ctx.reg;
-  let rollbackError: string | undefined;
-  try {
-    try {
-      await plugin.remove();
-    } catch {
-      // 忽略：旧注册可能已经不在。
-    }
-    await plugin.install(reg.path);
-    await waitRunning(deps, reg.path);
-  } catch (error) {
-    rollbackError = errorText(error);
-  }
-  serveCurrent(deps.home, reg.path, log);
-
-  const to: ReleaseRef = { version: ctx.cur.version ?? 'unknown', sha: ctx.cur.sha ?? 'unknown' };
-  if (rollbackError === undefined) {
-    await recordSafe(log, '回退记录', () => cloud.recordRollback({ from: ctx.target, to, at, reason: ctx.reason, outcome: 'rolled_back' }));
-    await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'rolled_back', target: ctx.target, at, error: ctx.reason }));
-    writeRolledBack(deps.home, log, { ...ctx.target, at: at.getTime() });
-    log(`已回退到 ${to.version}`);
-    return { kind: 'rolled_back', reason: ctx.reason, version: ctx.target.version, sha: ctx.target.sha };
-  }
-
-  const reason = `${ctx.reason}；回退也失败：${rollbackError}`;
-  await recordSafe(log, '回退记录', () => cloud.recordRollback({ from: ctx.target, to, at, reason, outcome: 'rollback_failed' }));
-  await recordSafe(log, '升级结果', () => cloud.recordUpgrade({ status: 'rollback_failed', target: ctx.target, at, error: reason }));
-  log(`回退失败，插件可能未运行：${rollbackError}`);
-  return { kind: 'rollback_failed', reason, version: ctx.target.version, sha: ctx.target.sha };
+  deps.log(`${reason}；现役 ${back.version}`);
+  await recordSafe(deps.log, '回退记录', () => deps.cloud.recordRollback({ from: target, to: back, at, reason, outcome: 'rolled_back' }));
+  await recordSafe(deps.log, '升级结果', () => deps.cloud.recordUpgrade({ status: 'rolled_back', target, at, error: reason }));
+  writeRolledBack(deps.home, deps.log, { ...target, at: at.getTime() });
 }
 
-/** 下载发行包与更新器，校验后解压、安装依赖，并把发行目录放到 plugin-releases/<sha>。 */
+function writePending(home: string, pending: Pending): void {
+  const dir = join(home, 'updater');
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (const path of [pending.toPath, pending.fromPath]) {
+    if (path !== undefined && /[\r\n]/.test(path)) throw new StepError('refused', '运行目录路径含换行，拒绝切换');
+  }
+  rmSync(join(home, `${PENDING_FILE}.attempts`), { force: true });
+  rmSync(join(home, `${PENDING_FILE}.rolled-back`), { force: true });
+  const meta = JSON.stringify({ to: pending.to, from: pending.from ?? null, at: pending.at });
+  const tmp = join(dir, `.pending.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, `${pending.toPath}\n${pending.fromPath ?? ''}\n${meta}\n`, { mode: 0o600 });
+    renameSync(tmp, join(home, PENDING_FILE));
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+}
+
+function readPending(home: string): Pending | undefined {
+  let text: string;
+  try {
+    text = readFileSync(join(home, PENDING_FILE), 'utf8');
+  } catch {
+    return undefined;
+  }
+  const [toPath, fromPath, metaLine] = text.split('\n');
+  if (!toPath || !isAbsolute(toPath) || metaLine === undefined) return undefined;
+  let meta: { to?: unknown; from?: unknown; at?: unknown };
+  try {
+    meta = JSON.parse(metaLine) as typeof meta;
+  } catch {
+    return undefined;
+  }
+  const to = refOf(meta.to);
+  if (to === undefined || typeof meta.at !== 'number') return undefined;
+  const from = refOf(meta.from);
+  return { toPath, fromPath: fromPath && isAbsolute(fromPath) && from ? fromPath : undefined, to, from: fromPath ? from : undefined, at: meta.at };
+}
+
+function refOf(value: unknown): ReleaseRef | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const ref = value as Record<string, unknown>;
+  return typeof ref.version === 'string' && typeof ref.sha === 'string' ? { version: ref.version, sha: ref.sha } : undefined;
+}
+
+function clearPending(home: string, log: (line: string) => void): void {
+  for (const name of [PENDING_FILE, `${PENDING_FILE}.attempts`, `${PENDING_FILE}.rolled-back`]) {
+    try {
+      rmSync(join(home, name), { force: true });
+    } catch (error) {
+      log(`清除待确认标记失败：${errorText(error)}`);
+    }
+  }
+}
+
+function readCount(path: string): number | undefined {
+  try {
+    const n = Number.parseInt(readFileSync(path, 'utf8').trim(), 10);
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 准备发行目录
+
 async function prepareRelease(
   deps: UpdaterDeps,
   tag: string,
   manifest: ReleaseManifest,
   staging: string,
   target: string,
-): Promise<string> {
+): Promise<void> {
   const packageFile = await fetchVerified(deps, tag, manifest.package, staging);
-  const updaterFile = await fetchVerified(deps, tag, manifest.updater, staging);
   const extractDir = join(staging, 'extract');
   mkdirSync(extractDir, { recursive: true });
   try {
@@ -316,19 +399,18 @@ async function prepareRelease(
   if (!matchesManifest(readJson(join(extractDir, 'release.json')), manifest)) {
     throw new StepError('refused', '发行包内 release.json 与清单不一致（产品、版本、sha 或 schema 要求），拒绝使用');
   }
-  if (!isDirectory(join(extractDir, 'plugin'))) {
-    throw new StepError('refused', '发行包缺少 plugin/ 目录，拒绝使用');
+  if (payloadOf(extractDir) === undefined) {
+    throw new StepError('refused', `发行包缺少运行目录（${PAYLOAD_DIRS.join(' 或 ')}），拒绝使用`);
   }
   rmSync(target, { recursive: true, force: true });
   renameSync(extractDir, target);
   try {
-    await deps.tools.installProd(join(target, 'plugin'));
+    await deps.tools.installProd(payloadOf(target)!);
   } catch (error) {
     // 半装的 node_modules 会被下一轮当作可复用目录，所以整目录删除。
     rmSync(target, { recursive: true, force: true });
-    throw new StepError('failed', `安装插件依赖失败：${errorText(error)}`);
+    throw new StepError('failed', `安装运行依赖失败：${errorText(error)}`);
   }
-  return updaterFile;
 }
 
 /** 下载单个资产到暂存目录并校验 sha256 与大小；不符则拒绝。 */
@@ -352,11 +434,21 @@ function plainAssetName(name: string): string {
   return name;
 }
 
+/** 发行目录里的运行目录：按 PAYLOAD_DIRS 顺序取第一个存在的目录。 */
+function payloadOf(releaseDir: string): string | undefined {
+  for (const name of PAYLOAD_DIRS) {
+    if (isDirectory(join(releaseDir, name))) return join(releaseDir, name);
+  }
+  return undefined;
+}
+
 /** 目标目录已有与清单一致的 release.json 且依赖已安装，可以直接复用。 */
 function isReusable(target: string, manifest: ReleaseManifest): boolean {
-  return existsSync(join(target, 'release.json'))
+  const payload = payloadOf(target);
+  return payload !== undefined
+    && existsSync(join(target, 'release.json'))
     && matchesManifest(readJson(join(target, 'release.json')), manifest)
-    && isDirectory(join(target, 'plugin', 'node_modules'));
+    && isDirectory(join(payload, 'node_modules'));
 }
 
 function matchesManifest(value: unknown, manifest: ReleaseManifest): boolean {
@@ -368,73 +460,28 @@ function matchesManifest(value: unknown, manifest: ReleaseManifest): boolean {
     && rel.requiredSchema === manifest.requiredSchema;
 }
 
-function currentOf(reg: PluginRegistration): Current {
-  const name = basename(dirname(reg.path));
-  const version = (readJson(join(reg.path, 'package.json')) as { version?: unknown } | null | undefined)?.version;
+/** current 解析出的现役版本；current 缺失时为空，指向服务目录之外时拒绝。 */
+function currentOf(home: string): Current {
+  const link = join(home, CURRENT_LINK);
+  const path = realOrUndefined(link);
+  if (path === undefined) return {};
+  const homeReal = realOrUndefined(home);
+  if (homeReal === undefined || !isInside(path, homeReal)) throw new StepError('refused', 'current 指向服务目录之外，未切换');
+  const name = basename(dirname(path));
+  const version = (readJson(join(path, 'package.json')) as { version?: unknown } | null | undefined)?.version;
   return {
+    path,
     version: typeof version === 'string' && SEMVER.test(version) ? version : undefined,
     sha: SHA40.test(name) ? name : undefined,
   };
 }
 
-/** 轮询直到插件处于 running、启用，并且注册路径就是 dir。超时抛错，错误文本含最后看到的状态。 */
-async function waitRunning(deps: UpdaterDeps, dir: string): Promise<void> {
-  const limit = deps.waitRunningMs ?? DEFAULT_WAIT_RUNNING_MS;
-  const poll = Math.max(1, deps.pollMs ?? DEFAULT_POLL_MS);
-  const want = realOrUndefined(dir);
-  let waited = 0;
-  let last = '未注册';
-  for (;;) {
-    try {
-      const reg = await deps.plugin.registration();
-      if (reg && reg.status === 'running' && reg.enabled && want !== undefined && realOrUndefined(reg.path) === want) return;
-      last = reg ? `状态 ${reg.status}，启用 ${reg.enabled ? '是' : '否'}，路径 ${reg.path}` : '未注册';
-    } catch (error) {
-      last = `读取失败：${errorText(error)}`;
-    }
-    if (waited >= limit) throw new Error(`插件未在 ${limit} 毫秒内进入运行状态（最后看到：${last}）`);
-    await deps.sleep(poll);
-    waited += poll;
-  }
-}
-
-/** 替换节点更新器单文件：先写同目录临时文件，再原子 rename。 */
-function installUpdater(home: string, source: string): void {
-  const dir = join(home, 'updater');
-  mkdirSync(dir, { recursive: true });
-  const tmp = join(dir, `.${UPDATER_ASSET}.${randomUUID()}.tmp`);
-  try {
-    copyFileSync(source, tmp);
-    chmodSync(tmp, 0o600);
-    renameSync(tmp, join(dir, UPDATER_ASSET));
-  } finally {
-    rmSync(tmp, { force: true });
-  }
-}
-
-/**
- * 把 current 指向 pluginDir，并把 pluginDir 所在发行目录里的 sck 工具脚本装到 bin/。
- * 插件已处于目标状态，这两步失败只记日志，不回退插件；发行目录缺脚本时保留 bin/ 里原有的文件。
- */
-function serveCurrent(home: string, pluginDir: string, log: (line: string) => void): void {
-  try {
-    pointCurrent(home, pluginDir);
-  } catch (error) {
-    log(`current 指向更新失败（sck 仍指向旧版本）：${errorText(error)}`);
-  }
-  try {
-    installToolScripts(home, dirname(pluginDir), log);
-  } catch (error) {
-    log(`sck 工具脚本安装失败（保留旧文件）：${errorText(error)}`);
-  }
-}
-
 /** current 是符号链接：先在同目录建临时链接，再 rename 覆盖，替换是原子的。 */
-function pointCurrent(home: string, pluginDir: string): void {
+function pointCurrent(home: string, payloadDir: string): void {
   const link = join(home, CURRENT_LINK);
   const tmp = join(home, `.current.${randomUUID()}.tmp`);
   try {
-    symlinkSync(resolve(pluginDir), tmp);
+    symlinkSync(resolve(payloadDir), tmp);
     renameSync(tmp, link);
   } finally {
     rmSync(tmp, { force: true });
@@ -460,18 +507,6 @@ function installToolScripts(home: string, releaseDir: string, log: (line: string
     } finally {
       rmSync(tmp, { force: true });
     }
-  }
-}
-
-/** 现役版本已是清单版本时，只把节点更新器文件对齐到清单；失败只记日志，不影响插件。 */
-async function refreshUpdater(deps: UpdaterDeps, tag: string, manifest: ReleaseManifest, staging: string): Promise<void> {
-  const bundle = join(deps.home, 'updater', UPDATER_ASSET);
-  try {
-    if (existsSync(bundle) && (await sha256File(bundle)).sha256 === manifest.updater.sha256.toLowerCase()) return;
-    installUpdater(deps.home, await fetchVerified(deps, tag, manifest.updater, staging));
-    deps.log('节点更新器已对齐到发行版本');
-  } catch (error) {
-    deps.log(`节点更新器对齐失败（插件不受影响）：${errorText(error)}`);
   }
 }
 
@@ -511,11 +546,11 @@ function clearRolledBack(home: string, log: (line: string) => void): void {
 }
 
 /**
- * 回收 plugin-releases 下的旧发行目录：名称为 40 位 hex、含 release.json，且不是目标或现役旧版本。
+ * 回收 plugin-releases 下的旧发行目录：名称为 40 位 hex、含 release.json，且不是新版本或回退目标。
  * 绝不删除 current 指向的目录（及其包含关系上的目录），不删除不含 release.json 的目录。
  */
 function recycle(home: string, keep: Array<string | undefined>, log: (line: string) => void): void {
-  const root = join(home, PLUGIN_RELEASES);
+  const root = join(home, RELEASES);
   const kept = new Set(keep.filter((sha): sha is string => sha !== undefined));
   const currentReal = realOrUndefined(join(home, CURRENT_LINK));
   let entries: Dirent[];
@@ -582,6 +617,11 @@ function acquireLock(home: string, at: Date): (() => void) | undefined {
   return undefined;
 }
 
+/** 更新锁是否被存活进程持有（供退役旧定时更新器时避开它正在进行的一轮）。 */
+export function updateLockHeld(home: string): boolean {
+  return lockHeld(join(home, 'updater', 'lock'));
+}
+
 function releaseLock(path: string): void {
   const body = readJson(path) as { pid?: unknown } | null | undefined;
   if (typeof body === 'object' && body !== null && body.pid === process.pid) rmSync(path, { force: true });
@@ -609,6 +649,11 @@ function pidAlive(pid: unknown): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
+}
+
+function sameDir(a: string, b: string): boolean {
+  const ra = realOrUndefined(a);
+  return ra !== undefined && ra === realOrUndefined(b);
 }
 
 function isInside(child: string, root: string): boolean {

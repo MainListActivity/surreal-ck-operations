@@ -1,15 +1,18 @@
 {
-  "version": "0.13.83",
-  "title": "SurrealDB 4.0.1 对齐：本机 fork 二进制与服务全景登记",
+  "version": "0.13.84",
+  "title": "执行端自更新：节点升级不再依赖 Paseo 插件",
   "changes": [
-    "AGENTS.md 本机 fork 二进制描述由 4.0.1-native-quota.1+sha.3362c137b 改为 +sha.eab8473e4d4e（sck-4.0.1-native-quota.1 正式发行构建，与生产镜像同一提交 eab8473e）。",
-    "landscape/company-landscape.json 的 surrealdb 条目登记当前生产版本与镜像 e68a34a4（rocksdb），2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。",
-    "本地 fork 测试夹具统一改用生产同款 rocksdb 引擎（surrealkv 在 4.0 下的并发冲突时序与生产不同，会让并发幂等用例误报）。"
+    "原生执行端每 15 分钟检查正式发行版本，空闲且本节点无租约时准备发行目录、核验 schema、写待确认标记并原子切换 current，排空后由 launchd 拉起新版本。",
+    "新版本首个心跳后确认：再核验 schema、安装 sck 工具脚本、回收旧目录并记升级成功；schema 不满足则自己指回旧版本。15 分钟未确认即退出。",
+    "启动脚本（native-service.ts 生成）按待确认标记计数，新版本连续 3 次启动未确认就把 current 指回旧版本，旧版本启动后补记 node_rollback 与 24 小时冷却。",
+    "执行端启动后卸载旧的 launchd 定时更新器（plist 移到 retired/）；node-updater.js 改为只打印接管说明的过渡文件，scripts/node-updater.sh 删除。",
+    "交付预览与老板接口（18777 局域网面、18778 签名面、/api/owner/*）移入执行端，端口被旧插件占用时每 5 秒重试，插件卸载后自动接管。",
+    "发行清单的 updater 资产改为可缺省，发行包运行目录兼容 runtime/ 与 plugin/ 两种布局，为删除 Paseo 插件做准备。"
   ],
   "impact": [
-    "登记表与生产现状一致：全景查询返回的 surrealdb 版本即生产实跑版本，升级与回滚资产可查。",
-    "沿用 schema 074，无迁移。"
+    "节点升级只依赖执行端、gh 与 pnpm，不再经过 paseo plugin install/remove；Paseo 守护进程未运行不再阻断升级。",
+    "沿用 schema 074，无迁移。本版仍是有效的 Paseo 插件，由旧更新器最后一次切换上线。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074），升级 owner-backend 即可。",
-  "rollback": "回退至 0.13.82；文档与登记表恢复旧版本描述（生产仍跑 4.0.1，登记表描述与现状不一致）。"
+  "migration": "无 schema 变化（沿用 schema 074）。上线后用本版 scripts/native-service.ts --no-load 重写启动脚本，使回退兜底生效。",
+  "rollback": "手工把 current 指回 0.13.83 的发行目录并重启执行端；如需旧定时更新器，把 retired/org.surrealck.node-updater.plist 移回 LaunchAgents 后 bootstrap。"
 }

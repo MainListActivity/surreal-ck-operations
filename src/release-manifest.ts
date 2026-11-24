@@ -27,7 +27,8 @@ export const releaseManifestSchema = z.object({
   requiredSchema: z.number().int().positive(),
   createdAt: z.string().min(1),
   package: releaseAssetSchema,
-  updater: releaseAssetSchema,
+  /** 旧版定时更新器的单文件包；执行端自更新不再使用，只为尚未升级的节点保留，可缺省。 */
+  updater: releaseAssetSchema.optional(),
 }).strict();
 
 export type ReleaseAsset = z.infer<typeof releaseAssetSchema>;
