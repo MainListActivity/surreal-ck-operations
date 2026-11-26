@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-20",
+  "updatedAt": "2026-11-26",
   "rules": [
     "公司服务以本文件为唯一登记处。不新增服务、进程、端口、域名、systemd 单元、launchd 任务、定时器或 Worker；新能力放进已登记的现有服务。确需新增时，任务卡必须明确授权，并在同一 PR 里先登记到本文件。",
     "退役服务先把 status 改为 retire，实际下线并经实机核对确认消失后再删除条目。",
@@ -242,6 +242,19 @@
       "status": "active",
       "verified": true,
       "notes": "CK 源站。运营 MCP /api/ops/mcp（含 test_kit_* 测试物料工具）在这个进程里，不是单独服务。"
+    },
+    {
+      "id": "coturn",
+      "repo": "surreal_ck",
+      "host": "vps-data",
+      "kind": "systemd",
+      "unit": "coturn.service",
+      "listen": "3478/tcp, 3478/udp, 5349/tcp, 49160-49359/udp",
+      "deploy": "按 surreal_ck docs/runbooks/meeting-turn.md 的部署与验证步骤执行",
+      "rollback": "按 surreal_ck docs/runbooks/meeting-turn.md 的回滚步骤执行",
+      "status": "review",
+      "verified": false,
+      "notes": "M-04 任务卡授权新增；待部署及实机核对。"
     },
     {
       "id": "surrealdb",
