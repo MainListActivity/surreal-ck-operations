@@ -17,6 +17,9 @@ sck-owner-daily.service loaded active exited daily jobs
 sck-owner-daily.timer loaded active waiting daily timer
 surreal-ck-hono.service loaded active running ck origin
 coturn.service loaded active running meeting TURN
+redis-server.service loaded active running meeting sfu redis
+livekit.service loaded active running meeting sfu
+livekit-egress.service loaded active running meeting egress
 surrealdb.service loaded active running database
 magpie-web.service loaded active running gateway
 caddy.service loaded active running proxy
