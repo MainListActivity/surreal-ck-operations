@@ -54,6 +54,11 @@ describe('employee sandbox launcher', () => {
     const root = service();
     const env = { SCK_SANDBOX: 'employee' };
     expect(run(root, env, '/bin/cat', join(root, 'private', 'service.env')).code).not.toBe(0);
+    const fakeHome = realpathSync(mkdtempSync(join(tmpdir(), 'sck-home-')));
+    dirs.push(fakeHome);
+    mkdirSync(join(fakeHome, '.oci'));
+    writeFileSync(join(fakeHome, '.oci', 'config'), '[DEFAULT]\nkey_file=/secret.pem\n');
+    expect(run(root, { ...env, HOME: fakeHome }, '/bin/cat', join(fakeHome, '.oci', 'config')).code).not.toBe(0);
     expect(run(root, env, '/usr/bin/touch', join(root, 'sandbox', 'employee.sb')).code).not.toBe(0);
     expect(run(root, env, '/usr/bin/touch', join(root, 'private', 'employee-agents.json')).code).not.toBe(0);
     expect(run(root, env, '/bin/launchctl', 'list').code).not.toBe(0);

@@ -16,6 +16,7 @@
 (deny file-read* file-write*
   (under service "/private")
   (under home "/.ssh")
+  (under home "/.oci")
   (under home "/.paseo")
   (under home "/.config/magpie")
   (under home "/.cloudflared")

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CompanyError } from '../src/core-errors.ts';
@@ -10,6 +10,14 @@ const ROOT = join(import.meta.dir, '..');
 const TEST_BIN = join(ROOT, 'vault', 'build', 'sck-vault-test');
 const SECRET = 'test-secret-7f3a-not-a-real-key';
 const SYNC_SECRET = 'test-secret-sync-9e1b-not-a-real-key';
+const OCI_PEM = '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAtestvaultocikeypayloadnotarealkey1234567890\n-----END RSA PRIVATE KEY-----\n';
+const OCI_SECRET = JSON.stringify({
+  user: 'ocid1.user.oc1..testuser',
+  fingerprint: '00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff',
+  tenancy: 'ocid1.tenancy.oc1..testtenancy',
+  region: 'us-phoenix-1',
+  keyPem: OCI_PEM,
+});
 const OUT = 'output_format=mp3_44100_128';
 
 interface Seen { method: string; path: string; key: string | null; type: string | null; body: string }
@@ -26,7 +34,7 @@ function runVault(args: string[], socket = join(dir, 'vault.sock')) {
   return Bun.spawnSync([TEST_BIN, ...args], { env: { ...process.env, SCK_VAULT_TEST_SOCKET: socket }, stdout: 'pipe', stderr: 'pipe' });
 }
 
-async function startVault(socket: string) {
+async function startVault(socket: string, ociBin?: string) {
   const proc = Bun.spawn([TEST_BIN, 'serve'], {
     env: {
       ...process.env,
@@ -35,6 +43,8 @@ async function startVault(socket: string) {
       SCK_VAULT_SYNC_TEST_BASE_URL: `http://127.0.0.1:${syncPort}`,
       SCK_VAULT_TEST_SECRET: SECRET,
       SCK_VAULT_SYNC_TEST_SECRET: SYNC_SECRET,
+      SCK_VAULT_OCI_TEST_SECRET: OCI_SECRET,
+      ...(ociBin ? { SCK_VAULT_OCI_TEST_BIN: ociBin } : {}),
     },
     stdout: 'ignore',
     stderr: 'pipe',
@@ -115,7 +125,33 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     servers = [up, other, sup];
     const build = Bun.spawnSync(['sh', join(ROOT, 'vault', 'build.sh'), '--test'], { stdout: 'pipe', stderr: 'pipe' });
     expect(build.exitCode).toBe(0);
-    vault = await startVault(socket);
+    const fakeOci = join(dir, 'fake-oci');
+    writeFileSync(fakeOci, [
+      '#!/usr/bin/env node',
+      'const fs = require("node:fs");',
+      'const argv = process.argv.slice(2);',
+      'const cfgIdx = argv.indexOf("--config-file");',
+      'const cfgPath = cfgIdx >= 0 ? argv[cfgIdx + 1] : "";',
+      'const cfgText = cfgPath ? fs.readFileSync(cfgPath, "utf8") : "";',
+      'const keyLine = cfgText.split("\\n").find(l => l.startsWith("key_file=")) || "";',
+      'const keyPath = keyLine.slice("key_file=".length);',
+      'const keyText = keyPath ? fs.readFileSync(keyPath, "utf8") : "";',
+      'if (argv.includes("--trigger-leak")) {',
+      '  process.stdout.write("leaked=" + keyText);',
+      '  process.stderr.write("err=" + keyText);',
+      '  process.exit(1);',
+      '}',
+      'process.stdout.write(JSON.stringify({',
+      '  argv,',
+      '  cfgPath,',
+      '  keyPath,',
+      '  keyHasPem: keyText.includes("BEGIN RSA PRIVATE KEY") && keyText.includes("OCI_API_KEY"),',
+      '  cfgHasPem: cfgText.includes("BEGIN RSA PRIVATE KEY"),',
+      '  leakedEnv: Boolean(process.env.SCK_VAULT_OCI_TEST_SECRET || process.env.SCK_VAULT_TEST_SECRET),',
+      '}));',
+    ].join('\n'), { mode: 0o755 });
+    chmodSync(fakeOci, 0o755);
+    vault = await startVault(socket, fakeOci);
     client = new VaultClient(socket);
   }, 30_000); // Swift cold compilation can exceed Bun's 5s hook default on the 16GB host.
 
@@ -132,9 +168,11 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     expect(status.providers).toEqual({
       elevenlabs: { configured: true, keyFp: fp(SECRET) },
       sync: { configured: true, keyFp: fp(SYNC_SECRET) },
+      oci: { configured: true, keyFp: fp(OCI_SECRET) },
     });
     expect(JSON.stringify(status)).not.toContain(SECRET);
     expect(JSON.stringify(status)).not.toContain(SYNC_SECRET);
+    expect(JSON.stringify(status)).not.toContain('BEGIN RSA PRIVATE KEY');
   });
 
   test('a call reaches the upstream with the key, on the fixed endpoint', async () => {
@@ -281,6 +319,42 @@ describe.skipIf(!swiftAvailable)('sck-vault end to end (test build, fake upstrea
     const audit = readFileSync(join(dir, 'audit.log'), 'utf8');
     expect(audit).not.toContain(SYNC_SECRET);
     expect(audit).toContain('"provider":"sync"');
+  });
+
+  test('oci runs inside sck-vault with unlinked /dev/fd/3 key, scrubbed env, and zero private key on disk', async () => {
+    const reply = await client.oci(['os', 'ns', 'get'], 15);
+    expect(reply.exitCode).toBe(0);
+    const parsed = JSON.parse(reply.stdout) as {
+      argv: string[]; cfgPath: string; keyPath: string; keyHasPem: boolean; cfgHasPem: boolean; leakedEnv: boolean;
+    };
+    expect(parsed.keyPath).toBe('/dev/fd/3');
+    expect(parsed.keyHasPem).toBe(true);
+    expect(parsed.cfgHasPem).toBe(false);
+    expect(parsed.leakedEnv).toBe(false);
+    expect(parsed.argv.slice(-3)).toEqual(['os', 'ns', 'get']);
+    expect(parsed.argv).toContain('--auth');
+    expect(parsed.argv).toContain('api_key');
+    // The short-lived non-secret config directory is removed as soon as the command finishes.
+    expect(existsSync(parsed.cfgPath)).toBe(false);
+
+    // Even if a buggy or hostile CLI echoes the key back, sck-vault scrubs it before replying.
+    const leaked = await client.oci(['os', 'ns', 'get', '--trigger-leak'], 15);
+    expect(leaked.exitCode).toBe(1);
+    expect(leaked.stdout).toContain('[已遮盖]');
+    expect(leaked.stderr).toContain('[已遮盖]');
+    expect(leaked.stdout).not.toContain('testvaultocikeypayloadnotarealkey1234567890');
+    expect(leaked.stderr).not.toContain('testvaultocikeypayloadnotarealkey1234567890');
+    expect(leaked.stdout).not.toContain('BEGIN RSA PRIVATE KEY');
+
+    // Vault itself refuses credential/file/endpoint override flags.
+    for (const bad of [['--config-file', '/x'], ['--endpoint', 'https://evil'], ['setup', 'config'], ['os', 'get', '--from-json', 'file:///etc/passwd']]) {
+      const err = await client.oci(bad).catch((e: unknown) => e);
+      expect((err as CompanyError).code).toBe('invalid');
+    }
+
+    const audit = readFileSync(join(dir, 'audit.log'), 'utf8');
+    expect(audit).toContain('"event":"oci"');
+    expect(audit).not.toContain('testvaultocikeypayloadnotarealkey1234567890');
   });
 
   test('a second vault cannot take over the socket of a running one', async () => {

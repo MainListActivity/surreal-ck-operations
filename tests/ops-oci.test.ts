@@ -1,38 +1,19 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
+import { CompanyError } from '../src/core-errors.ts';
 import { OPS_TOOLS, OpsBroker, type OpsDeps } from '../src/ops/broker.ts';
 import {
-  DEFAULT_OCI_ROLES, execOciCli, formatOciResult, ociAuditSummary, parseOciRequest, resolveOciConfig,
-  type OciControlConfig, type OciRunner,
+  DEFAULT_OCI_ROLES, formatOciResult, ociAuditSummary, parseOciRequest, resolveOciRoles, vaultOciRunner,
+  type OciRunner,
 } from '../src/ops/oci.ts';
 import { redactText } from '../src/ops/redact.ts';
 import { brokerConfig, FakeCompany, FakeWorld } from './support/ops-world.ts';
 
-const tempDirs: string[] = [];
-afterEach(() => {
-  while (tempDirs.length) rmSync(tempDirs.pop()!, { recursive: true, force: true });
-});
-
-function mkTempDir(prefix: string): string {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  tempDirs.push(dir);
-  return dir;
-}
-
-function makeRig(options: { hasEnv?: boolean; roles?: string[]; oci?: OciRunner; ociConfig?: OciControlConfig } = {}) {
+function makeRig(options: { hasEnv?: boolean; roles?: string[]; oci?: OciRunner; vault?: OpsDeps['vault'] } = {}) {
   const world = new FakeWorld();
   const company = new FakeCompany();
   if (options.hasEnv ?? true) {
     company.env('demo', 'production', brokerConfig(options.roles ? { roles: options.roles } : {}));
   }
-  const ociConfig: OciControlConfig = options.ociConfig ?? {
-    configFile: '/managed/private/oci/config',
-    profile: 'DEFAULT',
-    region: 'us-phoenix-1',
-    roles: DEFAULT_OCI_ROLES,
-  };
   const broker = new OpsBroker({
     core: company.core,
     projects: company.projects as never,
@@ -40,13 +21,14 @@ function makeRig(options: { hasEnv?: boolean; roles?: string[]; oci?: OciRunner;
     fetch: world.fetch,
     now: world.now,
     oci: options.oci,
-    ociConfig: () => ociConfig,
+    vault: options.vault,
+    ociRoles: () => DEFAULT_OCI_ROLES,
   } satisfies OpsDeps);
   const eng = company.lease('eng-1', 'engineering', 'task-1');
-  return { company, broker, eng, ociConfig };
+  return { company, broker, eng };
 }
 
-describe('ops_oci request parsing & config', () => {
+describe('ops_oci request parsing & roles', () => {
   test('accepts standard OCI CLI argv including -c / --compartment-id / --query / --region', () => {
     const req = parseOciRequest({
       argv: ['network', 'vcn', 'list', '-c', 'ocid1.tenancy.oc1..example', '--region', 'us-phoenix-1', '--query', 'data[].id'],
@@ -89,27 +71,10 @@ describe('ops_oci request parsing & config', () => {
     }
   });
 
-  test('resolveOciConfig defaults to <serviceHome>/private/oci/config and never falls back to ~/.oci/config', () => {
-    const cfg = resolveOciConfig('/srv/company', {});
-    expect(cfg).toEqual({
-      configFile: '/srv/company/private/oci/config',
-      profile: 'DEFAULT',
-      roles: DEFAULT_OCI_ROLES,
-    });
-    const custom = resolveOciConfig('/srv/company', {
-      SCK_OPS_OCI_CONFIG_FILE: '/opt/sck/oci.conf',
-      SCK_OPS_OCI_PROFILE: 'AGENT_MIN',
-      SCK_OPS_OCI_BIN: '/opt/homebrew/bin/oci',
-      SCK_OPS_OCI_REGION: 'us-phoenix-1',
-      SCK_OPS_OCI_ROLES: 'engineering, qa',
-    });
-    expect(custom).toEqual({
-      configFile: '/opt/sck/oci.conf',
-      profile: 'AGENT_MIN',
-      bin: '/opt/homebrew/bin/oci',
-      region: 'us-phoenix-1',
-      roles: ['engineering', 'qa'],
-    });
+  test('resolveOciRoles defaults to DEFAULT_OCI_ROLES and parses SCK_OPS_OCI_ROLES', () => {
+    expect(resolveOciRoles({})).toEqual(DEFAULT_OCI_ROLES);
+    expect(resolveOciRoles({ SCK_OPS_OCI_ROLES: 'engineering, qa, engineering' })).toEqual(['engineering', 'qa']);
+    expect(() => resolveOciRoles({ SCK_OPS_OCI_ROLES: 'not-a-role' })).toThrow();
   });
 
   test('audit summary records only command verbs and argument count, never flag values', () => {
@@ -147,22 +112,32 @@ describe('ops_oci redaction and formatting', () => {
   });
 });
 
-describe('OpsBroker ops_oci integration', () => {
-  test('ops_oci is registered in OPS_TOOLS and runs through broker with lease + audit', async () => {
+describe('OpsBroker ops_oci vault integration', () => {
+  test('ops_oci delegates to sck-vault through OpsBroker with lease + audit', async () => {
     expect(OPS_TOOLS).toContain('ops_oci');
-    const calls: Array<{ cfg: OciControlConfig; argv: string[]; timeoutSec: number }> = [];
+    const seen: Array<{ argv: string[]; timeoutSec?: number }> = [];
     const { broker, company, eng } = makeRig({
-      oci: async (cfg, req) => {
-        calls.push({ cfg, argv: req.argv, timeoutSec: req.timeoutSec });
-        return { exitCode: 0, stdout: '{"data":"mynamespace"}', stderr: '', durationMs: 42 };
+      vault: {
+        oci: async (argv, timeoutSec) => {
+          seen.push({ argv, timeoutSec });
+          return { exitCode: 0, stdout: '{"data":"mynamespace"}', stderr: '', durationMs: 42 };
+        },
       },
     });
-    const res = await broker.call(eng, 'task-1', 'ops_oci', { argv: ['os', 'ns', 'get'] }) as Record<string, unknown>;
+    const res = await broker.call(eng, 'task-1', 'ops_oci', { argv: ['os', 'ns', 'get'], timeoutSec: 20 }) as Record<string, unknown>;
     expect(res).toEqual({ ok: true, exitCode: 0, data: { data: 'mynamespace' }, truncated: false, durationMs: 42 });
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.argv).toEqual(['os', 'ns', 'get']);
+    expect(seen).toEqual([{ argv: ['os', 'ns', 'get'], timeoutSec: 20 }]);
     expect(company.audits.at(-1)).toMatchObject({ action: 'ops_call' });
     expect(company.audits.at(-1)!.evidence).toContain('ops_oci os ns get (argc=3) → exit=0');
+  });
+
+  test('propagates not_configured when sck-vault has no OCI credentials sealed in Keychain', async () => {
+    const runner = vaultOciRunner({
+      oci: async () => { throw new CompanyError('not_configured', 'oci 凭据未配置：请运行 sck-vault setup oci'); },
+    });
+    const { broker, eng } = makeRig({ oci: runner });
+    await expect(broker.call(eng, 'task-1', 'ops_oci', { argv: ['os', 'ns', 'get'] }))
+      .rejects.toMatchObject({ code: 'not_configured' });
   });
 
   test('works for infrastructure projects without project_env.broker (e.g. sck_company) while still enforcing lease & roles', async () => {
@@ -174,12 +149,10 @@ describe('OpsBroker ops_oci integration', () => {
     expect(res.ok).toBe(true);
     expect(res.data).toEqual({ data: [] });
 
-    // Disallowed role is rejected even without project_env.broker.
     const cs = company.lease('cs-1', 'cs', 'task-2');
     await expect(broker.call(cs, 'task-2', 'ops_oci', { argv: ['os', 'ns', 'get'] }))
       .rejects.toMatchObject({ code: 'forbidden' });
 
-    // Ended lease is rejected before running anything.
     company.endLease('eng-1');
     await expect(broker.call(eng, 'task-1', 'ops_oci', { argv: ['os', 'ns', 'get'] }))
       .rejects.toMatchObject({ code: 'forbidden' });
@@ -198,60 +171,5 @@ describe('OpsBroker ops_oci integration', () => {
     expect(res.ok).toBe(false);
     expect(res.exitCode).toBe(1);
     expect(res.stderr).toContain('NotAuthorizedOrNotFound');
-  });
-});
-
-describe('execOciCli real child-process isolation', () => {
-  test('fails closed with not_configured when managed config file is missing', async () => {
-    const dir = mkTempDir('sck-oci-missing-');
-    await expect(execOciCli({
-      configFile: join(dir, 'config'),
-      profile: 'DEFAULT',
-      roles: DEFAULT_OCI_ROLES,
-    }, { argv: ['os', 'ns', 'get'], timeoutSec: 5 })).rejects.toMatchObject({ code: 'not_configured' });
-  });
-
-  test('pins --config-file/--profile/--auth api_key and scrubs parent env from child process', async () => {
-    const dir = mkTempDir('sck-oci-real-');
-    const configFile = join(dir, 'config');
-    writeFileSync(configFile, '[AGENT]\nregion=us-phoenix-1\n', { mode: 0o600 });
-    const fakeOci = join(dir, 'fake-oci');
-    writeFileSync(fakeOci, [
-      '#!/usr/bin/env node',
-      'const out = {',
-      '  argv: process.argv.slice(2),',
-      '  home: process.env.HOME,',
-      '  leakedOci: process.env.OCI_CLI_KEY_FILE || null,',
-      '  leakedSck: process.env.SCK_OPS_CLOUDFLARE_API_TOKEN || null,',
-      '};',
-      'process.stdout.write(JSON.stringify(out));',
-    ].join('\n'), { mode: 0o755 });
-    chmodSync(fakeOci, 0o755);
-
-    const prevOci = process.env.OCI_CLI_KEY_FILE;
-    const prevSck = process.env.SCK_OPS_CLOUDFLARE_API_TOKEN;
-    process.env.OCI_CLI_KEY_FILE = '/should/not/leak.pem';
-    process.env.SCK_OPS_CLOUDFLARE_API_TOKEN = 'cf-should-not-leak';
-    try {
-      const out = await execOciCli({
-        configFile,
-        profile: 'AGENT',
-        bin: fakeOci,
-        region: 'us-phoenix-1',
-        roles: DEFAULT_OCI_ROLES,
-      }, { argv: ['os', 'ns', 'get'], timeoutSec: 10 });
-      expect(out.exitCode).toBe(0);
-      const parsed = JSON.parse(out.stdout) as { argv: string[]; home: string; leakedOci: string | null; leakedSck: string | null };
-      expect(parsed.argv).toEqual([
-        '--config-file', configFile, '--profile', 'AGENT', '--auth', 'api_key',
-        '--region', 'us-phoenix-1', 'os', 'ns', 'get',
-      ]);
-      expect(parsed.home).toBe(dir);
-      expect(parsed.leakedOci).toBeNull();
-      expect(parsed.leakedSck).toBeNull();
-    } finally {
-      if (prevOci === undefined) delete process.env.OCI_CLI_KEY_FILE; else process.env.OCI_CLI_KEY_FILE = prevOci;
-      if (prevSck === undefined) delete process.env.SCK_OPS_CLOUDFLARE_API_TOKEN; else process.env.SCK_OPS_CLOUDFLARE_API_TOKEN = prevSck;
-    }
   });
 });
