@@ -543,8 +543,8 @@ function buildServer(ctx: ToolContext): McpServer {
   server.registerTool(
     'company_ops',
     {
-      title: '公司只读运维命令',
-      description: `把白名单内的只读运维命令排队为执行端作业（${MCP_OPS_ALLOW.join('、')}）。需任务绑定。`,
+      title: '公司运维命令',
+      description: `把白名单内的受控运维命令排队为执行端作业（${MCP_OPS_ALLOW.join('、')}）。需任务绑定。`,
       inputSchema: z.object({ taskId: z.string(), tool: z.string(), args: z.record(z.string(), z.unknown()).optional() }),
     },
     guard<Record<string, unknown>>(ctx, 'mcp.company_ops', async (args) => {

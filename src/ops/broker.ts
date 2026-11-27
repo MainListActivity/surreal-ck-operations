@@ -26,6 +26,10 @@ import { opsFetch, type Fetcher } from './fetcher.ts';
 import { FUNNEL_PULSE_EVENTS, isFunnelPulseEvent, isUtcDay, parseFunnelPulse } from './funnel-pulse.ts';
 import { originLogsRequest, sshOriginAgent, type OriginAgent, type OriginRequest } from './origin.ts';
 import {
+  execOciCli, formatOciResult, ociAuditSummary, parseOciRequest, resolveOciConfig,
+  type OciControlConfig, type OciRunner,
+} from './oci.ts';
+import {
   originEvidence, readGithubRelease, readPublicRuntimeVersion, RELEASE_RUNTIME_VERSION_PATH, summarizeRelease,
   type OriginEvidence,
 } from './release-diagnosis.ts';
@@ -82,7 +86,7 @@ export const OPS_TOOLS = [
   'ops_idp_principal_mint', 'ops_idp_principal_revoke', 'ops_idp_principal_list', 'ops_idp_admin_request',
   'ops_idp_provision_rotate', 'ops_invitation_issue',
   'ops_internal_ai_prepare', 'ops_internal_ai_prove', 'ops_internal_ai_approval_diagnose', 'ops_internal_ai_deliver', 'ops_internal_ai_revoke', 'ops_internal_ai_trust', 'ops_internal_ai_rotate_key',
-  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_product_pulse', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose', 'ops_test_fixture_ready',
+  'ops_supplier_plan_sample', 'ops_product_magpie_observe', 'ops_product_magpie_candidate', 'ops_magpie_route_sample', 'ops_magpie_route_restore', 'ops_magpie_window_prepare', 'ops_product_magpie_price_approve', 'ops_platform_operator_list', 'ops_product_pulse', 'ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose', 'ops_test_fixture_ready', 'ops_oci',
 ] as const;
 export type OpsTool = typeof OPS_TOOLS[number];
 
@@ -108,6 +112,10 @@ export interface OpsDeps {
   queryAsUser?: QueryAsUser;
   browser?: BrowserInjector;
   originAgent?: OriginAgent;
+  /** Controlled local OCI CLI runner; production uses `execOciCli`, tests inject a fake runner. */
+  oci?: OciRunner;
+  /** Test seam: overrides `resolveOciConfig(serviceHome, process.env)` for `ops_oci`. */
+  ociConfig?: () => OciControlConfig;
   /** Read-only GitHub metadata for ops_release_diagnose; production uses the same gh CLI as the submit gate. */
   gh?: GhRunner;
   /** The task project's own repository, resolved from project configuration; never from a tool argument. */
@@ -218,7 +226,7 @@ const opsIdempotentOf = (tool: string, args: Args = {}): boolean => {
   switch (tool) {
     case 'ops_member_add': case 'ops_member_remove': case 'ops_invitation_issue':
     case 'ops_idp_provision_rotate': case 'ops_idp_admin_request': case 'ops_idp_principal_mint':
-    case 'ops_idp_principal_revoke': case 'ops_idp_client_register':
+    case 'ops_idp_principal_revoke': case 'ops_idp_client_register': case 'ops_oci':
       return false;
     case 'ops_request': {
       const method = typeof args.method === 'string' ? args.method.toUpperCase() : 'GET';
@@ -431,6 +439,7 @@ export class OpsBroker {
       ops_origin_logs: (ctx, args) => this.origin(ctx, originLogsRequest(args)),
       ops_release_diagnose: (ctx, args) => this.releaseDiagnose(ctx, args),
       ops_test_fixture_ready: (ctx, args) => this.testFixtureReady(ctx, args),
+      ops_oci: (ctx, args) => this.oci(ctx, args),
       ...Object.fromEntries(Object.keys(proofToolSchemas).map(tool => [tool, (ctx: Ctx, args: Args) => this.internalProof(ctx, tool as ProofTool, args)])) as Record<ProofTool, Handler>,
     };
   }
@@ -441,7 +450,9 @@ export class OpsBroker {
     if (!handler) throw invalid(`unknown ops tool: ${tool}`);
     const scope = await this.deps.core.opsScope(credential, taskId, proof);
     this.lastScope.set(scope.actor.employeeId, scope);
-    const ctx = { ...(await this.context(scope, args.env)), credential };
+    const ctx = tool === 'ops_oci'
+      ? { ...(await this.ociContext(scope, args.env)), credential }
+      : { ...(await this.context(scope, args.env)), credential };
     // The fault ledger's elapsedMs is the call's own monotone wall time, from here to the failure —
     // early failures and budget-exhausted logins included, never a trace sum (the trace caps its tail).
     const startedMs = this.monoNow();
@@ -570,6 +581,27 @@ export class OpsBroker {
     const cfg = parseBrokerConfig(row.broker);
     if (!cfg.roles.includes(scope.actor.role)) throw new CompanyError('forbidden', `role ${scope.actor.role} may not use ops tools on ${scope.project}/${row.name}`);
     return { scope, env: row.name, cfg, row };
+  }
+
+  /**
+   * `ops_oci` operates on shared OCI infrastructure rather than a product IdP/app environment:
+   * when the task's project has a broker environment (or `env` is explicitly requested), its role
+   * policy still applies; otherwise infrastructure projects (e.g. `sck_company`) fall back to the
+   * OCI control-plane role list without requiring product broker config.
+   */
+  private async ociContext(scope: OpsScope, requested: unknown): Promise<Ctx> {
+    if (requested !== undefined && typeof requested !== 'string') throw invalid('env must be a string');
+    const rows = (await this.deps.projects.brokerEnvs(scope.project)).filter(row => row.broker !== undefined && row.broker !== null);
+    if (rows.length > 0 || requested !== undefined) return this.context(scope, requested);
+    const ociCfg = this.ociControlConfig();
+    if (!ociCfg.roles.includes(scope.actor.role)) {
+      throw new CompanyError('forbidden', `role ${scope.actor.role} may not use ops_oci on ${scope.project}`);
+    }
+    return { scope, env: 'oci', cfg: undefined as unknown as BrokerConfig, row: { name: 'oci' } };
+  }
+
+  private ociControlConfig(): OciControlConfig {
+    return this.deps.ociConfig ? this.deps.ociConfig() : resolveOciConfig(this.serviceHome());
   }
 
   private async audit(ctx: Ctx, action: string, evidence: string): Promise<void> {
@@ -835,6 +867,22 @@ export class OpsBroker {
     const value = redactJson(reply, this.sessions.secrets(ctx.scope.actor.employeeId));
     const detail = request.op === 'logs' ? ` service=${request.service} since=${request.since} matched=${String(reply.matched)}${request.grep ? ` grep=${request.grep}` : ''}` : '';
     return { value, audit: { action: 'ops_call', evidence: `ops_origin_${request.op} host=${ctx.cfg.origin.host}${detail}` } };
+  }
+
+  /**
+   * Controlled local OCI CLI proxy: runs `oci` with `--config-file`, `--profile`, `--auth api_key`
+   * pinned by the broker (no shell, no credential/file override flags). Authorization is enforced
+   * by OCI IAM policies attached to the configured API key.
+   */
+  private async oci(ctx: Ctx, args: Args): Promise<Outcome> {
+    const req = parseOciRequest(args);
+    const cfg = this.ociControlConfig();
+    const out = await (this.deps.oci ?? execOciCli)(cfg, req);
+    const value = formatOciResult(out, this.sessions.secrets(ctx.scope.actor.employeeId));
+    return {
+      value,
+      audit: { action: 'ops_call', evidence: `ops_oci ${ociAuditSummary(req.argv)} → exit=${out.exitCode} (${out.durationMs}ms)` },
+    };
   }
 
   /**
