@@ -171,10 +171,13 @@ export function company(): Promise<Company> {
       console.log(`snapshot build ${stats.kind} ${stats.outcome} rows=${stats.rows} bytes=${stats.bytes} batches=${stats.batches} load=${Math.round(stats.loadMs)} reserve=${Math.round(stats.reserveMs)} write=${Math.round(stats.writeMs)} commit=${Math.round(stats.commitMs)} server=${Math.round(stats.serverMs)} total=${Math.round(stats.totalMs)} reads=${stats.loadAttempts} release=${stats.release} releaseMs=${Math.round(stats.releaseMs)}`);
     const core = new SurrealCompanyCore(db, { workforce, snapshotObserve, worktrees: worktreeOpts, nodeId, submitCheck: process.env.SCK_PR_GATE === "0" ? undefined : createSubmitCheck(),
       systemCheck: process.env.SCK_SUBMIT_CHECKS === "0" ? undefined : createSystemCheck({ serviceHome: serviceHome(), home: homedir() }) });
+    const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;
+    // Provider keys (ElevenLabs, sync, OCI) live only in sck-vault (Keychain-bound); this side never sees them.
+    const vault = new VaultClient(join(serviceHome(), "vault", "vault.sock"));
     // Sealed credentials, login tokens and the Cloudflare token live only in this process; agents
     // reach them through the sidecar relay as named, audited, lease-gated operations.
     const ops = new OpsBroker({
-      core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db),
+      core, projects: new ProjectStore(db.db), secretKey: loadSecretKey, proofStore: new CompanyProofStore(db.db), vault,
       // M3 release diagnosis reads the task project's own repository binding, never a caller-named repo.
       projectRepoSlug: async (project: string) => {
         const view = await new ProjectStore(db.db).get(project).catch(() => undefined);
@@ -191,9 +194,6 @@ export function company(): Promise<Company> {
       closeBrowserSpace: egoBrowserSpaceCloser,
       log: message => console.log(message),
     });
-    const runDir = process.env.SCK_COMM_ROOT ?? `${process.env.HOME}/Library/Application Support/SurrealCKCompany/comm`;
-    // Provider keys live only in sck-vault (its own process, Keychain-bound); this side never sees them.
-    const vault = new VaultClient(join(serviceHome(), "vault", "vault.sock"));
     const media = new MediaStudio({
       core, vault, evidenceRoot: join(dirname(runDir), "evidence"),
     });

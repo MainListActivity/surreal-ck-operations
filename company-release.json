@@ -1,17 +1,17 @@
 {
-  "version": "0.13.86",
-  "title": "接入本机受控 OCI CLI 代理工具 ops_oci",
+  "version": "0.13.87",
+  "title": "OCI 凭据迁入 sck-vault 钥匙串硬隔离（零落盘私钥）",
   "changes": [
-    "新增 src/ops/oci.ts 并在 OpsBroker 注册 ops_oci {argv, timeoutSec?}：本机无 shell 直接调用受控 oci CLI，固定 --config-file/--profile/--auth api_key，权限完全由 OCI IAM 策略控制。",
-    "凭据与宿主机隔离：默认读 <serviceHome>/private/oci/config（不回退 ~/.oci/config），拦截凭据/端点/file:///debug/setup/session 越权参数，子进程仅传最小隔离环境，launch-env 清理 OCI_*。",
-    "输出与脱敏：返回结构化 JSON（或脱敏截断的 stdout/stderr 与 exitCode），redact.ts 增补 PEM 私钥块脱敏；无 project_env.broker 的基础设施项目按 OCI 控制面角色清单放行并照常校验租约与落审计。",
-    "公司 MCP 白名单 MCP_OPS_ALLOW 加入 ops_oci，本机 sck call / sck mcp 与云端 company_ops（含 mcp.budget.set 次数预算）均统一可用。"
+    "扩展 vault/main.swift（sck-vault）支持 oci provider：老板经 sck-vault setup oci 写入 macOS 登录钥匙串，Keychain ACL 仅绑定签名后的 sck-vault 二进制，磁盘不再保存 OCI 私钥文件。",
+    "sck-vault 新增 op: \"oci\"，用先 unlink 再写入的匿名文件描述符 /dev/fd/3 与 posix_spawn(POSIX_SPAWN_CLOEXEC_DEFAULT) 将私钥传给本机 oci 子进程，执行后由内核自动回收；输出先做 PEM 与密钥双重脱敏并记哈希链审计。",
+    "ops_oci（src/ops/oci.ts、OpsBroker、runner/company.ts）全面改走 VaultClient.oci 经 vault.sock 执行，移除基于磁盘 private/oci/config 的明文配置路径，VaultClient 补齐 not_configured 错误映射。",
+    "员工 Seatbelt 沙箱 scripts/sandbox/employee.sb 新增封禁 ~/.oci 读写，与既有 vault.sock 封禁配合确保员工既读不到密钥也无法绕过工具直连。"
   ],
   "impact": [
-    "启用前需在宿主机 <serviceHome>/private/oci/config 放置最小权限 OCI API Key 配置（或设 SCK_OPS_OCI_CONFIG_FILE）；未配置时 ops_oci 明确返回 not_configured，不影响其他能力。",
-    "员工会话环境与 zsh 垫片新增清理 OCI_* 环境变量。",
+    "本机需重编译安装 sck-vault（sh vault/build.sh）并运行 sck-vault setup oci 导入最小权限 OCI API Key，再重启 org.surrealck.vault 即生效；已有 elevenlabs/sync 密钥保持不变。",
+    "员工沙箱禁止读写 ~/.oci；原 private/oci/config 磁盘路径不再使用。",
     "沿用 schema 074，无数据库迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）。在宿主机放置受控 OCI API Key 配置文件 <serviceHome>/private/oci/config（0600 权限）后即刻生效，可选通过 SCK_OPS_OCI_PROFILE / SCK_OPS_OCI_REGION / SCK_OPS_OCI_BIN / SCK_OPS_OCI_ROLES 调整。",
-  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.85；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
+  "migration": "无 schema 变化（沿用 schema 074）。在宿主机执行 sh vault/build.sh 更新 sck-vault，再运行 sck-vault setup oci 将最小权限 OCI API Key 存入钥匙串并重启 org.surrealck.vault。",
+  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.86；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
 }

@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import type { CompanyCore, OpsScope } from '../contracts.ts';
+import type { CompanyCore, OpsScope, Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
 import { faultFactsOf, type FaultPhase, type FaultRefund, type FaultTargetKind } from '../faults.ts';
 import { lanIPv4 } from '../preview-core.ts';
@@ -25,9 +25,10 @@ import { cloudflareD1, type D1Client } from './d1.ts';
 import { opsFetch, type Fetcher } from './fetcher.ts';
 import { FUNNEL_PULSE_EVENTS, isFunnelPulseEvent, isUtcDay, parseFunnelPulse } from './funnel-pulse.ts';
 import { originLogsRequest, sshOriginAgent, type OriginAgent, type OriginRequest } from './origin.ts';
+import { VaultClient } from '../media/vault.ts';
 import {
-  execOciCli, formatOciResult, ociAuditSummary, parseOciRequest, resolveOciConfig,
-  type OciControlConfig, type OciRunner,
+  formatOciResult, ociAuditSummary, parseOciRequest, resolveOciRoles, vaultOciRunner,
+  type OciRunner,
 } from './oci.ts';
 import {
   originEvidence, readGithubRelease, readPublicRuntimeVersion, RELEASE_RUNTIME_VERSION_PATH, summarizeRelease,
@@ -112,10 +113,12 @@ export interface OpsDeps {
   queryAsUser?: QueryAsUser;
   browser?: BrowserInjector;
   originAgent?: OriginAgent;
-  /** Controlled local OCI CLI runner; production uses `execOciCli`, tests inject a fake runner. */
+  /** Keychain-backed sck-vault client used by `ops_oci` so private keys never sit on disk or in this process. */
+  vault?: Pick<VaultClient, 'oci'>;
+  /** Test seam: overrides the default `vaultOciRunner(...)` for `ops_oci`. */
   oci?: OciRunner;
-  /** Test seam: overrides `resolveOciConfig(serviceHome, process.env)` for `ops_oci`. */
-  ociConfig?: () => OciControlConfig;
+  /** Test seam: overrides `resolveOciRoles(process.env)` when a project has no `project_env.broker`. */
+  ociRoles?: () => readonly Role[];
   /** Read-only GitHub metadata for ops_release_diagnose; production uses the same gh CLI as the submit gate. */
   gh?: GhRunner;
   /** The task project's own repository, resolved from project configuration; never from a tool argument. */
@@ -593,15 +596,11 @@ export class OpsBroker {
     if (requested !== undefined && typeof requested !== 'string') throw invalid('env must be a string');
     const rows = (await this.deps.projects.brokerEnvs(scope.project)).filter(row => row.broker !== undefined && row.broker !== null);
     if (rows.length > 0 || requested !== undefined) return this.context(scope, requested);
-    const ociCfg = this.ociControlConfig();
-    if (!ociCfg.roles.includes(scope.actor.role)) {
+    const roles = this.deps.ociRoles ? this.deps.ociRoles() : resolveOciRoles();
+    if (!roles.includes(scope.actor.role)) {
       throw new CompanyError('forbidden', `role ${scope.actor.role} may not use ops_oci on ${scope.project}`);
     }
     return { scope, env: 'oci', cfg: undefined as unknown as BrokerConfig, row: { name: 'oci' } };
-  }
-
-  private ociControlConfig(): OciControlConfig {
-    return this.deps.ociConfig ? this.deps.ociConfig() : resolveOciConfig(this.serviceHome());
   }
 
   private async audit(ctx: Ctx, action: string, evidence: string): Promise<void> {
@@ -870,14 +869,14 @@ export class OpsBroker {
   }
 
   /**
-   * Controlled local OCI CLI proxy: runs `oci` with `--config-file`, `--profile`, `--auth api_key`
-   * pinned by the broker (no shell, no credential/file override flags). Authorization is enforced
-   * by OCI IAM policies attached to the configured API key.
+   * Controlled OCI CLI proxy backed by `sck-vault`: private keys stay in macOS Keychain under
+   * the signed `sck-vault` ACL and are passed to `oci` only via an unlinked `/dev/fd/3` descriptor.
+   * Authorization is enforced by OCI IAM policies attached to that key.
    */
   private async oci(ctx: Ctx, args: Args): Promise<Outcome> {
     const req = parseOciRequest(args);
-    const cfg = this.ociControlConfig();
-    const out = await (this.deps.oci ?? execOciCli)(cfg, req);
+    const runner = this.deps.oci ?? vaultOciRunner(this.deps.vault ?? new VaultClient(join(this.serviceHome(), 'vault', 'vault.sock')));
+    const out = await runner(req);
     const value = formatOciResult(out, this.sessions.secrets(ctx.scope.actor.employeeId));
     return {
       value,

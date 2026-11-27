@@ -15,6 +15,12 @@ export interface VaultStatus {
   /** Per-provider state keyed by name; each entry carries a short SHA-256 fingerprint of the key on file. */
   providers?: Record<string, { configured: boolean; keyFp?: string }>;
 }
+export interface VaultOciReply {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+}
 export interface MediaVault {
   status(): Promise<VaultStatus>;
   call(kind: string, params: Record<string, unknown>): Promise<VaultReply>;
@@ -23,7 +29,8 @@ export interface MediaVault {
 /** Music generation can take minutes upstream, so the reply window is longer than the vault's own timeouts. */
 const REPLY_MS = 330_000;
 const CODES: Partial<Record<string, CompanyError['code']>> = {
-  forbidden: 'forbidden', invalid: 'invalid', busy: 'temporarily_unavailable', upstream_error: 'upstream_error', limit_reached: 'limit_reached',
+  forbidden: 'forbidden', invalid: 'invalid', not_configured: 'not_configured',
+  busy: 'temporarily_unavailable', upstream_error: 'upstream_error', limit_reached: 'limit_reached',
 };
 
 export class VaultClient implements MediaVault {
@@ -52,6 +59,21 @@ export class VaultClient implements MediaVault {
       contentType: String(reply.contentType ?? ''),
       body: Buffer.from(String(reply.bodyBase64 ?? ''), 'base64'),
       headers,
+    };
+  }
+
+  /** Runs one OCI CLI command inside sck-vault using Keychain-sealed credentials (key never leaves vault). */
+  async oci(argv: string[], timeoutSec?: number): Promise<VaultOciReply> {
+    const reply = await this.request({
+      op: 'oci',
+      argv,
+      ...(timeoutSec === undefined ? {} : { timeoutSec }),
+    });
+    return {
+      exitCode: Number(reply.exitCode ?? 1),
+      stdout: String(reply.stdout ?? ''),
+      stderr: String(reply.stderr ?? ''),
+      durationMs: Number(reply.durationMs ?? 0),
     };
   }
 

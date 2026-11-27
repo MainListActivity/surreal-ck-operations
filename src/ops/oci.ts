@@ -1,13 +1,12 @@
-// Controlled local OCI CLI broker.
-// Employees never receive OCI credentials or host OCI env vars; they pass an argv array to
-// `ops_oci`, this trusted module executes the local `oci` binary directly (no shell) pinned
-// to the managed config file/profile with `--auth api_key`, and permissions are enforced by
-// OCI IAM policies. Only redacted, size-bounded output returns to the employee.
-import { execFile } from 'node:child_process';
-import { accessSync, constants } from 'node:fs';
-import { dirname, isAbsolute, join } from 'node:path';
+// Controlled OCI CLI broker facade backed by sck-vault.
+// The OCI private key lives ONLY in the macOS login Keychain under an ACL bound to the signed
+// `sck-vault` binary — never on disk, never in employee env, never inside the Node/Bun runner.
+// Employees pass an argv array to `ops_oci`; this module validates arguments against credential/
+// host-file escapes, delegates execution over `vault.sock` to `sck-vault`, and redacts/bounds
+// the output. Command authorization is enforced by OCI IAM policies.
 import type { Role } from '../contracts.ts';
 import { CompanyError } from '../core-errors.ts';
+import type { VaultClient } from '../media/vault.ts';
 import { clip, redactJson, redactText } from './redact.ts';
 
 const VALID_ROLES: readonly Role[] = [
@@ -15,19 +14,14 @@ const VALID_ROLES: readonly Role[] = [
   'asset-production', 'screenwriter', 'story-author', 'cinematography', 'qa', 'cs',
 ];
 export const DEFAULT_OCI_ROLES: readonly Role[] = ['engineering', 'qa', 'product', 'gm', 'owner'];
-const DEFAULT_BIN_CANDIDATES = ['/opt/homebrew/bin/oci', '/usr/local/bin/oci', '/usr/bin/oci'] as const;
 
 const MAX_ARGS = 64;
 const MAX_ARG_BYTES = 4096;
 const DEFAULT_TIMEOUT_SEC = 45;
 const MIN_TIMEOUT_SEC = 1;
 const MAX_TIMEOUT_SEC = 90;
-const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 const STDOUT_LIMIT_CHARS = 48_000;
 const STDERR_LIMIT_CHARS = 8_000;
-
-const PROFILE_RE = /^[A-Za-z0-9._-]{1,64}$/;
-const REGION_RE = /^[a-z0-9-]{2,64}$/;
 
 /**
  * Global flags that would redirect credentials, endpoints, local files, debug auth dumps, or
@@ -53,19 +47,6 @@ const BLOCKED_COMMANDS = new Set(['setup', 'session']);
 
 const invalid = (message: string) => new CompanyError('invalid', message);
 
-export interface OciControlConfig {
-  /** Absolute path to the managed OCI config file (never falls back to `~/.oci/config`). */
-  configFile: string;
-  /** Profile name inside `configFile` (default: `DEFAULT`). */
-  profile: string;
-  /** Optional explicit path to the `oci` binary; auto-detected from standard paths when omitted. */
-  bin?: string;
-  /** Optional default region passed when the caller did not specify `--region`. */
-  region?: string;
-  /** Roles allowed to invoke `ops_oci` when the task's project has no `project_env.broker`. */
-  roles: readonly Role[];
-}
-
 export interface OciRequest {
   argv: string[];
   timeoutSec: number;
@@ -88,9 +69,11 @@ export interface OciResult {
   durationMs: number;
 }
 
-export type OciRunner = (cfg: OciControlConfig, req: OciRequest) => Promise<OciRunOutput>;
+export type OciRunner = (req: OciRequest) => Promise<OciRunOutput>;
 
-function parseRoles(raw: string | undefined): readonly Role[] {
+/** Resolves the roles allowed to call `ops_oci` when the task's project has no `project_env.broker`. */
+export function resolveOciRoles(env: Record<string, string | undefined> = process.env): readonly Role[] {
+  const raw = env.SCK_OPS_OCI_ROLES;
   if (!raw || !raw.trim()) return DEFAULT_OCI_ROLES;
   const parsed = raw.split(',').map((s) => s.trim()).filter(Boolean);
   if (!parsed.length || parsed.some((role) => !VALID_ROLES.includes(role as Role))) {
@@ -99,42 +82,10 @@ function parseRoles(raw: string | undefined): readonly Role[] {
   return [...new Set(parsed as Role[])];
 }
 
-/**
- * Resolves the managed OCI CLI settings from the control-plane environment and service home.
- * Defaults to `<serviceHome>/private/oci/config` so the broker never silently touches the
- * owner's personal `~/.oci/config`.
- */
-export function resolveOciConfig(
-  serviceHome: string,
-  env: Record<string, string | undefined> = process.env,
-): OciControlConfig {
-  const configFile = env.SCK_OPS_OCI_CONFIG_FILE?.trim() || join(serviceHome, 'private', 'oci', 'config');
-  if (!isAbsolute(configFile) || configFile.includes('\0') || configFile.includes('\n')) {
-    throw new CompanyError('not_configured', 'SCK_OPS_OCI_CONFIG_FILE 必须是合法的绝对路径');
-  }
-  const profile = env.SCK_OPS_OCI_PROFILE?.trim() || 'DEFAULT';
-  if (!PROFILE_RE.test(profile)) {
-    throw new CompanyError('not_configured', 'SCK_OPS_OCI_PROFILE 格式无效');
-  }
-  const bin = env.SCK_OPS_OCI_BIN?.trim() || undefined;
-  if (bin !== undefined && (!isAbsolute(bin) || bin.includes('\0') || bin.includes('\n'))) {
-    throw new CompanyError('not_configured', 'SCK_OPS_OCI_BIN 必须是合法的绝对路径');
-  }
-  const region = env.SCK_OPS_OCI_REGION?.trim() || undefined;
-  if (region !== undefined && !REGION_RE.test(region)) {
-    throw new CompanyError('not_configured', 'SCK_OPS_OCI_REGION 格式无效');
-  }
-  return { configFile, profile, ...(bin ? { bin } : {}), ...(region ? { region } : {}), roles: parseRoles(env.SCK_OPS_OCI_ROLES) };
-}
-
 function flagNameOf(token: string): string | undefined {
   if (!token.startsWith('--')) return undefined;
   const eq = token.indexOf('=');
   return (eq > 0 ? token.slice(0, eq) : token).toLowerCase();
-}
-
-function hasRegionFlag(argv: readonly string[]): boolean {
-  return argv.some((token) => token === '--region' || token.startsWith('--region='));
 }
 
 /** Validates `ops_oci` tool arguments and blocks credential/host-file escape flags. */
@@ -198,82 +149,10 @@ export function ociAuditSummary(argv: readonly string[]): string {
   return `${head} (argc=${argv.length})`;
 }
 
-function resolveOciBinary(configured?: string): string {
-  if (configured) {
-    try {
-      accessSync(configured, constants.X_OK);
-      return configured;
-    } catch {
-      throw new CompanyError('not_configured', `指定的 OCI CLI 不可执行：${configured}`);
-    }
-  }
-  for (const candidate of DEFAULT_BIN_CANDIDATES) {
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch { /* try next candidate */ }
-  }
-  throw new CompanyError('not_configured', '本机未找到可执行 oci CLI（可安装 oci-cli 或设置 SCK_OPS_OCI_BIN）');
+/** Delegates OCI CLI execution to the signed `sck-vault` daemon over its private Unix socket. */
+export function vaultOciRunner(vault: Pick<VaultClient, 'oci'>): OciRunner {
+  return (req) => vault.oci(req.argv, req.timeoutSec);
 }
-
-function assertReadableConfig(configFile: string): void {
-  try {
-    accessSync(configFile, constants.R_OK);
-  } catch {
-    throw new CompanyError(
-      'not_configured',
-      `未配置受控 OCI 凭据文件（默认路径 <serviceHome>/private/oci/config，或设置 SCK_OPS_OCI_CONFIG_FILE）`,
-    );
-  }
-}
-
-/**
- * Executes the local `oci` CLI directly (`shell: false`) pinned to the managed config/profile
- * with `--auth api_key` and a scrubbed child environment.
- */
-export const execOciCli: OciRunner = async (cfg, req) => {
-  assertReadableConfig(cfg.configFile);
-  const bin = resolveOciBinary(cfg.bin);
-  const pinned: string[] = ['--config-file', cfg.configFile, '--profile', cfg.profile, '--auth', 'api_key'];
-  if (cfg.region && !hasRegionFlag(req.argv)) pinned.push('--region', cfg.region);
-  const fullArgv = [...pinned, ...req.argv];
-  const env: NodeJS.ProcessEnv = {
-    PATH: '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin',
-    HOME: dirname(cfg.configFile),
-    LANG: 'C.UTF-8',
-    LC_ALL: 'C.UTF-8',
-    OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: 'True',
-  };
-  const started = Date.now();
-  return new Promise((resolve, reject) => {
-    execFile(bin, fullArgv, {
-      shell: false,
-      timeout: req.timeoutSec * 1000,
-      maxBuffer: MAX_BUFFER_BYTES,
-      encoding: 'utf8',
-      env,
-    }, (error, stdout, stderr) => {
-      const durationMs = Math.max(0, Date.now() - started);
-      if (!error) {
-        return resolve({ exitCode: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), durationMs });
-      }
-      const err = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string; code?: number | string };
-      if (err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
-        return reject(new CompanyError('upstream_error', 'oci 命令输出超过 2MiB 上限，请使用 --limit 或 --query 缩小返回范围', false));
-      }
-      if (err.killed || err.signal === 'SIGTERM' || err.signal === 'SIGKILL') {
-        return reject(new CompanyError('upstream_error', `oci 命令执行超时（${req.timeoutSec}s）`, true));
-      }
-      if (typeof err.code === 'number') {
-        // Non-zero exit from OCI CLI (e.g. IAM 403/404 NotAuthorizedOrNotFound, bad parameter):
-        // return structured output so the agent can see the exact OCI service message.
-        return resolve({ exitCode: err.code, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), durationMs });
-      }
-      const reason = err.code ? String(err.code) : (err.message || 'exec failed').slice(0, 160);
-      reject(new CompanyError('upstream_error', `oci CLI 启动失败：${reason}`, true));
-    });
-  });
-};
 
 /** Redacts and size-bounds raw OCI CLI output; parses valid JSON stdout into structured `data`. */
 export function formatOciResult(out: OciRunOutput, knownSecrets: readonly string[] = []): OciResult {
