@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
  * agent's environment, so blanking them would break the agent. `SCK_SCRUB_ENV` (comma separated)
  * adds names or prefixes without a code change.
  */
-const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELEVENLABS_", "XI_API_KEY", "COMPANY_", "RUNNER_", "IDP_", "GATEWAY_"];
+const EXTERNAL = ["CLOUDFLARE_", "CF_API_", "SURREAL", "JEV_", "TYPESAFE_", "ELEVENLABS_", "XI_API_KEY", "OCI_", "COMPANY_", "RUNNER_", "IDP_", "GATEWAY_"];
 /** Plumbing variables only the company itself sets; a shell startup file never exports these. */
 const INTERNAL = ["SCK_OPS_", "SCK_PRODUCT_ENV", "SCK_MCP_TOKEN", "SCK_OWNER_TOKEN", "SCK_SERVICE_GATE", "SCK_EMPLOYEE_CREDENTIAL"];
 /** Server-side secrets kept in shell-shaped config (private/service.env is sourceable): blanked at

@@ -35,9 +35,10 @@ describe('scrubEnv', () => {
     expect(env.SSH_AUTH_SOCK).toBeUndefined();
   });
 
-  test('the ElevenLabs key names are blanked as well', () => {
-    expect(blockedPatterns()).toEqual(expect.arrayContaining(['ELEVENLABS_', 'XI_API_KEY']));
-    expect(scrubEnv({}, { ELEVENLABS_API_KEY: 'el', XI_API_KEY: 'xi', PATH: '/bin' })).toEqual({ ELEVENLABS_API_KEY: '', XI_API_KEY: '' });
+  test('the ElevenLabs and OCI key names are blanked as well', () => {
+    expect(blockedPatterns()).toEqual(expect.arrayContaining(['ELEVENLABS_', 'XI_API_KEY', 'OCI_']));
+    expect(scrubEnv({}, { ELEVENLABS_API_KEY: 'el', XI_API_KEY: 'xi', OCI_CLI_KEY_FILE: '/k.pem', OCI_CONFIG_FILE: '/c', PATH: '/bin' }))
+      .toEqual({ ELEVENLABS_API_KEY: '', XI_API_KEY: '', OCI_CLI_KEY_FILE: '', OCI_CONFIG_FILE: '' });
   });
 
   test('values the launch sets explicitly win over the blanking', () => {

@@ -2,11 +2,12 @@
 // tokens or passwords, even when an upstream response echoes one.
 const SECRET_KEY = /^(?:.*[_-])?(access_?token|refresh_?token|id_?token|token|password|passwd|secret|client_?secret|api_?key|private_?key|authorization|code_?verifier|login_?challenge|activation_?url|activation_?token|invitation_?token|token_?hash)$/i;
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g;
+const PEM_PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 const MASK = '[redacted]';
 
 /** Replaces known secret values and anything shaped like a JWT inside free text. */
 export function redactText(text: string, known: readonly string[] = []): string {
-  let out = text.replace(JWT, MASK);
+  let out = text.replace(PEM_PRIVATE_KEY, MASK).replace(JWT, MASK);
   out = out.replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, `Bearer ${MASK}`)
     .replace(/\b(?:sk-(?:ant-)?|gh[pousr]_)[A-Za-z0-9_-]{10,}/g, MASK)
     .replace(/(\b["']?(?:[\w-]{0,80}(?:token|password|passwd|secret|api[_-]?key)|authorization)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi, `$1${MASK}`);

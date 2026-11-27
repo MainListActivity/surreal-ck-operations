@@ -252,11 +252,12 @@ describe('公司 MCP 工具', () => {
     expect(enqueue?.vars.content).toMatchObject({ command: 'ops_origin_status', actor_kind: 'agent', actor: EMPLOYEE });
   });
 
-  test('company_ops 白名单扩展：ops_origin_logs 与 ops_health 可入队作业', async () => {
+  test('company_ops 白名单扩展：ops_origin_logs、ops_health 与 ops_oci 可入队作业', async () => {
     const token = await mcpToken();
-    for (const tool of ['ops_origin_logs', 'ops_health']) {
+    for (const tool of ['ops_origin_logs', 'ops_health', 'ops_oci']) {
       const { db, calls } = boundDb();
-      const { body } = await callTool(token, db, 'company_ops', { taskId: 't1', tool, args: {} });
+      const args = tool === 'ops_oci' ? { argv: ['os', 'ns', 'get'] } : {};
+      const { body } = await callTool(token, db, 'company_ops', { taskId: 't1', tool, args });
       const value = resultOf(body)?.structuredContent as { pending?: boolean; jobId?: string };
       expect(value.pending, tool).toBe(true);
       const enqueue = calls.find((call) => call.sql.includes('CREATE $job'));

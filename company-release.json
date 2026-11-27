@@ -1,19 +1,17 @@
 {
-  "version": "0.13.85",
-  "title": "删除 Paseo 插件：发行包只含执行端运行目录",
+  "version": "0.13.86",
+  "title": "接入本机受控 OCI CLI 代理工具 ops_oci",
   "changes": [
-    "删除 plugin/ 目录（Paseo 插件入口、页面、RPC、会话钩子、插件版预览与老板控制台）；节点上派工、员工通道、交付预览与老板接口只在原生执行端。",
-    "发行包改为 release.json + runtime/（根 package.json、pnpm-lock.yaml、src/、schema/、landscape/）+ scripts/；不再生成 vendor，也不再发布 node-updater.js。",
-    "scripts/plugin-package.ts 改名 scripts/release-package.ts；--verify-install 在 --prod 依赖下打包执行端与 sck 入口，确认导入可解析。",
-    "版本号只在根 package.json 与 company-release.json 两处维护；CI 去掉 plugin 安装、vendor 与插件 typecheck。",
-    "删除只在 Paseo 插件进程里有意义的 plugin_runtime_diagnostics 工具；老板接口去掉 Paseo 权限应答 permission.list/answer。",
-    "交付预览列表的设计变量移到 src/relay-tokens.ts。"
+    "新增 src/ops/oci.ts 并在 OpsBroker 注册 ops_oci {argv, timeoutSec?}：本机无 shell 直接调用受控 oci CLI，固定 --config-file/--profile/--auth api_key，权限完全由 OCI IAM 策略控制。",
+    "凭据与宿主机隔离：默认读 <serviceHome>/private/oci/config（不回退 ~/.oci/config），拦截凭据/端点/file:///debug/setup/session 越权参数，子进程仅传最小隔离环境，launch-env 清理 OCI_*。",
+    "输出与脱敏：返回结构化 JSON（或脱敏截断的 stdout/stderr 与 exitCode），redact.ts 增补 PEM 私钥块脱敏；无 project_env.broker 的基础设施项目按 OCI 控制面角色清单放行并照常校验租约与落审计。",
+    "公司 MCP 白名单 MCP_OPS_ALLOW 加入 ops_oci，本机 sck call / sck mcp 与云端 company_ops（含 mcp.budget.set 次数预算）均统一可用。"
   ],
   "impact": [
-    "本版由 0.13.84 的执行端自更新切换上线（首次真实走切换、确认与运行目录布局变化）；current 指向 plugin-releases/<sha>/runtime。",
-    "Paseo 侧不再有 sck-company 插件；只能由 Paseo 运行的 antigravity 员工定义不再被派工。",
-    "沿用 schema 074，无迁移。"
+    "启用前需在宿主机 <serviceHome>/private/oci/config 放置最小权限 OCI API Key 配置（或设 SCK_OPS_OCI_CONFIG_FILE）；未配置时 ops_oci 明确返回 not_configured，不影响其他能力。",
+    "员工会话环境与 zsh 垫片新增清理 OCI_* 环境变量。",
+    "沿用 schema 074，无数据库迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）。节点上的 sck-company 插件在 0.13.84 上线后已卸载；执行端自更新会把 current 切到 runtime/ 布局，bin/sck 在确认时替换。",
-  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.84；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
+  "migration": "无 schema 变化（沿用 schema 074）。在宿主机放置受控 OCI API Key 配置文件 <serviceHome>/private/oci/config（0600 权限）后即刻生效，可选通过 SCK_OPS_OCI_PROFILE / SCK_OPS_OCI_REGION / SCK_OPS_OCI_BIN / SCK_OPS_OCI_ROLES 调整。",
+  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.85；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
 }

@@ -8,8 +8,8 @@ import { RecordId, type Surreal } from 'surrealdb';
 import { CompanyError } from './core-errors.ts';
 import { mcpPrincipalsOf } from './mcp-principals.ts';
 
-/** company_ops 允许转发的只读运维命令全集；预算键只能是这里的工具名。 */
-export const MCP_OPS_ALLOW = ['ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose', 'ops_product_pulse', 'ops_health'] as const;
+/** company_ops 允许转发的受控运维命令全集；预算键只能是这里的工具名。 */
+export const MCP_OPS_ALLOW = ['ops_origin_status', 'ops_origin_health', 'ops_origin_logs', 'ops_release_diagnose', 'ops_product_pulse', 'ops_health', 'ops_oci'] as const;
 
 const TASK_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const BUDGET_MIN = 0;
