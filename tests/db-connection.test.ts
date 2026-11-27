@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Surreal } from 'surrealdb';
 import { connectDb, openDb, queryDb, useDb, type DbTarget } from '../src/db-connection.ts';
+import { runSchemaQuery } from '../src/database.ts';
 
 setDefaultTimeout(60000);
 
@@ -73,6 +74,31 @@ test('queryDb runs the SQL with its bindings and resolves to the per-statement r
   const result = await queryDb<[Array<{ id: number }>, unknown[]]>(client, 'SELECT id FROM item WHERE kind = $kind;', { kind: 'x' });
   expect(calls).toEqual([{ method: 'query', args: ['SELECT id FROM item WHERE kind = $kind;', { kind: 'x' }] }]);
   expect(result).toEqual([[{ id: 1 }], []]);
+});
+
+test('runSchemaQuery retries SurrealDB transaction conflicts with exponential backoff and stops on non-conflict errors', async () => {
+  const waits: number[] = [];
+  let tries = 0;
+  await runSchemaQuery(async () => {
+    tries++;
+    if (tries < 3) throw new Error('There was a problem with the key-value store: Transaction conflict: !tbworktree_audit. This transaction can be retried');
+  }, { baseDelayMs: 10, sleep: async (ms) => { waits.push(ms); } });
+  expect(tries).toBe(3);
+  expect(waits).toEqual([10, 20]);
+
+  let nonConflictTries = 0;
+  await expect(runSchemaQuery(async () => {
+    nonConflictTries++;
+    throw new Error('syntax error');
+  }, { baseDelayMs: 10, sleep: async () => {} })).rejects.toThrow('syntax error');
+  expect(nonConflictTries).toBe(1);
+
+  let exhaustedTries = 0;
+  await expect(runSchemaQuery(async () => {
+    exhaustedTries++;
+    throw new Error('Transaction conflict: !qm. This transaction can be retried');
+  }, { maxAttempts: 3, baseDelayMs: 5, sleep: async () => {} })).rejects.toThrow('Transaction conflict');
+  expect(exhaustedTries).toBe(3);
 });
 
 // ---- Real server: an isolated fork on a private RocksDB store, like the other fork tests ----
