@@ -102,6 +102,31 @@ const pause = (ms: number): Promise<void> => new Promise(resolve => {
 /** 本版本 applySchema 的最后一个结构版本；云端 bootstrap 只核对库内版本不低于它。 */
 export const CLOUD_SCHEMA_VERSION = 74;
 
+const SCHEMA_CONFLICT_RE = /Transaction conflict|This transaction can be retried/i;
+
+/**
+ * 线上库在运行中执行幂等 schema 迁移时，RocksDB 可能与并发心跳/任务写入撞上可重试事务冲突；
+ * 仅对 SurrealDB 显式标为可重试的冲突做有界退避重试，其它错误立即抛出。
+ */
+export async function runSchemaQuery(
+  run: () => Promise<unknown>,
+  options: { maxAttempts?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<void> {
+  const maxAttempts = options.maxAttempts ?? 6;
+  const baseDelayMs = options.baseDelayMs ?? 150;
+  const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await run();
+      return;
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (attempt >= maxAttempts || !SCHEMA_CONFLICT_RE.test(msg)) throw error;
+      await sleep(baseDelayMs * (2 ** (attempt - 1)));
+    }
+  }
+}
+
 export class CompanyDatabase {
   /** 当前会话的客户端；云端续期或重连时整体替换（见 rebuildNow）。 */
   private session = new Surreal({ streaming: false });
@@ -444,196 +469,197 @@ export class CompanyDatabase {
    */
   async applySchema(fresh: boolean): Promise<void> {
     this.requireMigrator('应用公司库结构');
-    await this.db.query(loadSchema('001-control.surql'));
+    const exec = (sql: string, vars?: Record<string, unknown>) => runSchemaQuery(() => this.db.query(sql, vars));
+    await exec(loadSchema('001-control.surql'));
     if (fresh) {
-      await this.db.query('CREATE company_meta:installation CONTENT { owner: $owner, schema_version: 1 };', { owner: OWNER });
+      await exec('CREATE company_meta:installation CONTENT { owner: $owner, schema_version: 1 };', { owner: OWNER });
     }
-    await this.db.query(loadSchema('003-workforce.surql'));
-    await this.db.query(loadSchema('004-eval.surql'));
-    await this.db.query(loadSchema('005-jev.surql'));
-    await this.db.query(loadSchema('006-flow.surql'));
-    await this.db.query(loadSchema('007-gate.surql'));
-    await this.db.query(loadSchema('008-content-roles.surql'));
-    await this.db.query(loadSchema('009-discipline-tracks.surql'));
-    await this.db.query(loadSchema('010-instruct.surql'));
-    await this.db.query(loadSchema('010-internal-ai-proof.surql'));
-    await this.db.query(loadSchema('011-worktrees.surql'));
-    await this.db.query(loadSchema('012-worktree-lifecycle.surql'));
-    await this.db.query(loadSchema('013-screenwriter-role.surql'));
-    await this.db.query(loadSchema('014-task-project-overlay.surql'));
-    await this.db.query(loadSchema('014-worktree-scene.surql'));
-    await this.db.query(loadSchema('015-screenplay-revisions.surql'));
-    await this.db.query(loadSchema('016-worktree-lane.surql'));
-    await this.db.query(loadSchema('017-code-repo-binding.surql'));
-    await this.db.query(loadSchema('018-pipeline.surql'));
-    await this.db.query(loadSchema('019-story-author-role.surql'));
-    await this.db.query(loadSchema('020-cinematography-role.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
+    await exec(loadSchema('003-workforce.surql'));
+    await exec(loadSchema('004-eval.surql'));
+    await exec(loadSchema('005-jev.surql'));
+    await exec(loadSchema('006-flow.surql'));
+    await exec(loadSchema('007-gate.surql'));
+    await exec(loadSchema('008-content-roles.surql'));
+    await exec(loadSchema('009-discipline-tracks.surql'));
+    await exec(loadSchema('010-instruct.surql'));
+    await exec(loadSchema('010-internal-ai-proof.surql'));
+    await exec(loadSchema('011-worktrees.surql'));
+    await exec(loadSchema('012-worktree-lifecycle.surql'));
+    await exec(loadSchema('013-screenwriter-role.surql'));
+    await exec(loadSchema('014-task-project-overlay.surql'));
+    await exec(loadSchema('014-worktree-scene.surql'));
+    await exec(loadSchema('015-screenplay-revisions.surql'));
+    await exec(loadSchema('016-worktree-lane.surql'));
+    await exec(loadSchema('017-code-repo-binding.surql'));
+    await exec(loadSchema('018-pipeline.surql'));
+    await exec(loadSchema('019-story-author-role.surql'));
+    await exec(loadSchema('020-cinematography-role.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 20 WHERE schema_version < 20;');
     // The SYS01 snapshot schemas follow main's 021 (worktree audit events) and 022 (def quota limits).
-    await this.db.query(loadSchema('021-worktree-audit-events.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
-    await this.db.query(loadSchema('022-def-quota-limited.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
-    await this.db.query(loadSchema('023-query-snapshot.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
-    await this.db.query(loadSchema('024-snapshot-quota.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
+    await exec(loadSchema('021-worktree-audit-events.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 21 WHERE schema_version < 21;');
+    await exec(loadSchema('022-def-quota-limited.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 22 WHERE schema_version < 22;');
+    await exec(loadSchema('023-query-snapshot.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 23 WHERE schema_version < 23;');
+    await exec(loadSchema('024-snapshot-quota.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 24 WHERE schema_version < 24;');
 // SYS02 验收（本 lane，编号 026）：只新增表与 gate 记录。
-    await this.db.query(loadSchema('026-acceptance.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 26 WHERE schema_version < 26;');
+    await exec(loadSchema('026-acceptance.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 26 WHERE schema_version < 26;');
     // SYS02 gate record: additive and disabled on install. The release application enables the scope it lists (AC06).
-    await this.db.query(`IF (SELECT * FROM ONLY company_meta:acceptance_gate) = NONE {
+    await exec(`IF (SELECT * FROM ONLY company_meta:acceptance_gate) = NONE {
       CREATE ONLY company_meta:acceptance_gate CONTENT { version: 1, enabled: false, scope: 'code-deliveries', criteria_version: 1 };
     };`);
     // QA 受限只读取证（SYS-DISP 7454fc89）：025/026 由在办 lane 预占，本 lane 取 027；仅新增表。
-    await this.db.query(loadSchema('027-qa-observation.surql'));
-    await this.db.query(loadSchema('032-model-routing.surql'));
-    await this.db.query(loadSchema('033-four-tier-routing.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');
+    await exec(loadSchema('027-qa-observation.surql'));
+    await exec(loadSchema('032-model-routing.surql'));
+    await exec(loadSchema('033-four-tier-routing.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 27 WHERE schema_version < 27;');
     // 独立性策略（SYS-DISP 8c732ae6 IR01）：028 由本线取用（025/026 为在办 lane 预占，027 已被 QA 取证占用）；只新增字段，旧行不动。
-    await this.db.query(loadSchema('028-independence-policy.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 28 WHERE schema_version < 28;');
+    await exec(loadSchema('028-independence-policy.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 28 WHERE schema_version < 28;');
     // 登记身份（SYS-DISP IR02/Q3）：029 由本线取用；只新增表与字段，不改任何已有员工行。
-    await this.db.query(loadSchema('029-identity-principal.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
+    await exec(loadSchema('029-identity-principal.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 29 WHERE schema_version < 29;');
     // SYS03 经理处置账本（编号 034，随主干合入；030/031 为在办 lane 预占）：只新增表与唯一索引，
     // 不改写 task/audit/outbox/dispatch 的任何既有字段或行，回滚旧版即忽略这些新状态（RB01）。
-    await this.db.query(loadSchema('034-disposition.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
+    await exec(loadSchema('034-disposition.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 34 WHERE schema_version < 34;');
     // 有效策略层（SYS06 P1）：主干已取用 034（SYS03 处置账本），本线模块合线时重排为 035；只新增表与字段，旧行不动。
-    await this.db.query(loadSchema('035-effective-policy.surql'));
-    await this.db.query(`IF (SELECT * FROM ONLY company_meta:policy_epoch) = NONE {
+    await exec(loadSchema('035-effective-policy.surql'));
+    await exec(`IF (SELECT * FROM ONLY company_meta:policy_epoch) = NONE {
       CREATE ONLY company_meta:policy_epoch CONTENT { value: 0 };
     };`);
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 35 WHERE schema_version < 35;');
+    await exec('UPDATE company_meta:installation SET schema_version = 35 WHERE schema_version < 35;');
     // SYS03 第三轮（QA v23 退回，编号 036）：重放围栏与出口占位两个新字段。只新增字段，旧版 release 读到多出来的
     // 字段会忽略、新版对旧行按 NONE 兜底，所以新旧两版能同时对着同一批行工作（RB01）。
-    await this.db.query(loadSchema('036-disposition-replay-fence.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 36 WHERE schema_version < 36;');
+    await exec(loadSchema('036-disposition-replay-fence.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 36 WHERE schema_version < 36;');
     // SYS04 P0：故障归组、持久恢复预算与修复链（编号 037）。只新增表与索引，不改写任何既有表、字段或行：
     // 旧版 release 读不到这四张表（忽略），也不认识 fault 状态，所以回滚后照旧派工；真正的隔离靠原任务
     // 进入既有依赖等待语义（defer/waits），那由新版写入 task 的既有字段，不改旧字段（RB01）。
-    await this.db.query(loadSchema('037-fault-budget.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
-    await this.db.query(loadSchema('038-goal-workspaces.surql'));
-    await this.db.query(loadSchema('039-task-recovery.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 39 WHERE schema_version < 39;');
+    await exec(loadSchema('037-fault-budget.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 37 WHERE schema_version < 37;');
+    await exec(loadSchema('038-goal-workspaces.surql'));
+    await exec(loadSchema('039-task-recovery.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 39 WHERE schema_version < 39;');
     // SYS05 P1：时间与外部事件等待状态机（编号 040；039 已由 main 的 task-recovery 占用）。只新增 task_wait /
     // wait_event 两张表与索引；任务上的 wait_* 是 schemaless 新字段。进入等待时任务置为 blocked（旧版派工
     // 队列不收），旧版读不到新表即忽略，因此回滚后不会认领或拉起等待中的任务（RB01）。
-    await this.db.query(loadSchema('040-waits.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 40 WHERE schema_version < 40;');
+    await exec(loadSchema('040-waits.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 40 WHERE schema_version < 40;');
     // SYS07 P2：目标成果契约、证据、终验缺口与指标。只新增 goal_outcome / goal_evidence 两张表与 goal 的可选
     // 新字段；旧版忽略这些字段和表，历史任务、验收与老板决定不被改写（RB01）。
-    await this.db.query(loadSchema('042-goal-governance.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 42 WHERE schema_version < 42;');
+    await exec(loadSchema('042-goal-governance.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 42 WHERE schema_version < 42;');
     // SYS-INT：版本化验收映射的导入标记。只新增 task 可选字段；旧版读不到即按 legacy 处理，不误派不误关（RB01）。
-    await this.db.query(loadSchema('043-acceptance-mapping.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 43 WHERE schema_version < 43;');
+    await exec(loadSchema('043-acceptance-mapping.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 43 WHERE schema_version < 43;');
     // SYS-INT：QA 评审协同的持久事件唤醒（编号 044）。只新增 qa_review_watch / qa_review_signal / qa_review_wake
     // 三张表与索引；协同任务仍用 040 的 task_wait，事件只解除等待并把任务放回 ready。旧版读不到新表即忽略，
     // 行为退回固定时间等待（RB01：不误派、不误关）。
-    await this.db.query(loadSchema('044-review-events.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 44 WHERE schema_version < 44;');
+    await exec(loadSchema('044-review-events.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 44 WHERE schema_version < 44;');
     // 任务成本（编号 045）：Magpie 逐请求用量按任务汇总的 task_cost 表。只新增表；旧版忽略（RB01）。
-    await this.db.query(loadSchema('045-task-cost.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 45 WHERE schema_version < 45;');
+    await exec(loadSchema('045-task-cost.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 45 WHERE schema_version < 45;');
     // FV06 窗口绑定（编号 046）：internal_ai_candidate 增加 type/source_path 两个可选字段，标明远端候选来源。
     // 只新增字段，不改既有行；旧版读不到新字段即按 v2 候选处理（RB01）。
-    await this.db.query(loadSchema('046-remote-candidate.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 46 WHERE schema_version < 46;');
+    await exec(loadSchema('046-remote-candidate.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 46 WHERE schema_version < 46;');
     // SYS04 故障修复凭据消耗（编号 047）：一条真实修复完成凭据最多自动解除一次恢复预算。只新增一张表与 fault_repair 的
     // 两个可选字段；旧版读不到即忽略（RB01）。首次升到 047 时记下凭据起点：之后的 accept / owner_approve 审计才是凭据，
     // 升级前已完成的修复不是凭据，所以升级本身不解除任何预算。
-    await this.db.query(loadSchema('047-fault-repair-credential.surql'));
-    await this.db.query(`UPDATE company_meta:installation SET fault_credential_since = time::now()
+    await exec(loadSchema('047-fault-repair-credential.surql'));
+    await exec(`UPDATE company_meta:installation SET fault_credential_since = time::now()
       WHERE schema_version < 47 AND fault_credential_since = NONE;`);
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 47 WHERE schema_version < 47;');
+    await exec('UPDATE company_meta:installation SET schema_version = 47 WHERE schema_version < 47;');
     // 经理验收要求修订（编号 048；047 已由故障修复凭据占用）：holder_notice.kind 白名单新增 acceptance_amended。修订正文
     // 追加在既有 task.context，不新增任务字段、不改任何既有行；旧版 release 读到未知 kind 按既有通用文本投递一次（RB01）。
-    await this.db.query(loadSchema('048-acceptance-amend.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 48 WHERE schema_version < 48;');
+    await exec(loadSchema('048-acceptance-amend.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 48 WHERE schema_version < 48;');
     // FV06 恢复取证子租约（编号 049）：只新增 recovery_read_grant / recovery_read_chain / recovery_read_call 三张表。grant 不改变源任务、
     // 不建预算、不 lift；旧 release 读不到这三张表即忽略（RB01）。
-    await this.db.query(loadSchema('049-recovery-read-grant.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 49 WHERE schema_version < 49;');
+    await exec(loadSchema('049-recovery-read-grant.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 49 WHERE schema_version < 49;');
     // FV06 恢复唤醒可观测性（编号 050）：只给 recovery_read_grant 增补两个可选字段 last_wake_at / last_skip_reason，
     // 记录 dispatcher 最近一次唤醒尝试与最近一次跳过原因；不改 state 机、限额、既有路径或任何既有行（RB01）。
-    await this.db.query(loadSchema('050-recovery-read-wake.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 50 WHERE schema_version < 50;');
+    await exec(loadSchema('050-recovery-read-wake.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 50 WHERE schema_version < 50;');
     // 051：派工体系重构（待发消息表、任务需求/验收标准字段、owner 岗位撤销迁移）。只新增表与字段，
     // 迁移是幂等 UPDATE：旧版 release 读不到新表即忽略（RB01）。
-    await this.db.query(loadSchema('051-role-message-flow.surql'));
-    await this.db.query(loadSchema('052-task-routes.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 52 WHERE schema_version < 52;');
+    await exec(loadSchema('051-role-message-flow.surql'));
+    await exec(loadSchema('052-task-routes.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 52 WHERE schema_version < 52;');
     // 053：线的笔记。只新增 lane_note 表，不改既有行；旧 release 读不到新表即忽略（RB01）。
-    await this.db.query(loadSchema('053-lane-notes.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
+    await exec(loadSchema('053-lane-notes.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 53 WHERE schema_version < 53;');
     // 054：线的笔记整理（合并、清理与可撤销的整理记录）。只新增 note_consolidation 表与 lane_note 的两个可选字段；
     // 旧 release 读不到即忽略（RB01）。
-    await this.db.query(loadSchema('054-note-consolidation.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 54 WHERE schema_version < 54;');
+    await exec(loadSchema('054-note-consolidation.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 54 WHERE schema_version < 54;');
     // 公司库访问方式（编号 055）：只在 COMPANY_JWKS_URL 与 COMPANY_ISSUER 都配置时应用，否则跳过并留一行日志（本机模式）。
     // 055 只新增访问方式与事件、不新增表，所以不推进 schema_version。
     const { companyJwksUrl, companyIssuer } = this.config;
     if (companyJwksUrl && companyIssuer) {
-      await this.db.query(renderCompanyAccess(loadSchema('055-access.surql'), companyJwksUrl, companyIssuer));
+      await exec(renderCompanyAccess(loadSchema('055-access.surql'), companyJwksUrl, companyIssuer));
     } else {
       console.log('跳过公司库访问方式（055）：未同时配置 COMPANY_JWKS_URL 与 COMPANY_ISSUER，保持本机访问');
     }
     // 老板保护与员工策略（编号 056）：protected_command / agent_policy / ops_audit 三张新表与写入事件，本机与公司库都应用。
-    await this.db.query(loadSchema('056-command-guard.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 56 WHERE schema_version < 56;');
+    await exec(loadSchema('056-command-guard.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 56 WHERE schema_version < 56;');
     // 057：老板看板的执行端心跳（编号 057，054-056 未用）。只新增 runner_heartbeat 表；旧 release 读不到即忽略（RB01）。
-    await this.db.query(loadSchema('057-runner-heartbeat.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
+    await exec(loadSchema('057-runner-heartbeat.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 57 WHERE schema_version < 57;');
     // 058：老板端共享核心（编号 058）。只新增 ops_job、agent_identity 与译文、员工语言、审计摘要字段；旧 release 读不到即忽略（RB01）。
-    await this.db.query(loadSchema('058-owner-end.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 58 WHERE schema_version < 58;');
+    await exec(loadSchema('058-owner-end.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 58 WHERE schema_version < 58;');
     // 059：移除 runner / automation 字段守卫（老板定：员工有任务即可执行老板端全部操作）。
-    await this.db.query(loadSchema('059-drop-runner-field-guards.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 59 WHERE schema_version < 59;');
+    await exec(loadSchema('059-drop-runner-field-guards.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 59 WHERE schema_version < 59;');
     // 060：删除模型评分、排序与本地网关的账本；员工会话绑定任务（session_task）。
-    await this.db.query(loadSchema('060-drop-scoring-gateway.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 60 WHERE schema_version < 60;');
+    await exec(loadSchema('060-drop-scoring-gateway.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 60 WHERE schema_version < 60;');
     // 061：节点记录与升级回退记录（每台执行端一行 node_release；node_rollback 追加写）。只新增表与索引，不改任何既有行；旧 release 读不到即忽略（RB01）。
-    await this.db.query(loadSchema('061-node-release.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 61 WHERE schema_version < 61;');
+    await exec(loadSchema('061-node-release.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 61 WHERE schema_version < 61;');
     // 062：删除 outbox 事件表、序号索引与计数器（0.7.1）。0.7.0 起核心不再写 outbox；前提是所有执行端已是 0.7.0 或更新。
-    await this.db.query(loadSchema('062-drop-outbox.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
-    await this.db.query(loadSchema('063-product-iteration.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 63 WHERE schema_version < 63;');
-    await this.db.query(loadSchema('064-runner-lifecycle.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 64 WHERE schema_version < 64;');
-    await this.db.query(loadSchema('065-dispatch-attempt.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 65 WHERE schema_version < 65;');
-    await this.db.query(loadSchema('066-agent-activity.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 66 WHERE schema_version < 66;');
+    await exec(loadSchema('062-drop-outbox.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 62 WHERE schema_version < 62;');
+    await exec(loadSchema('063-product-iteration.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 63 WHERE schema_version < 63;');
+    await exec(loadSchema('064-runner-lifecycle.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 64 WHERE schema_version < 64;');
+    await exec(loadSchema('065-dispatch-attempt.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 65 WHERE schema_version < 65;');
+    await exec(loadSchema('066-agent-activity.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 66 WHERE schema_version < 66;');
     // 067：员工回报（提交、退回、受阻说明）译成老板常用语言的译文表。
-    await this.db.query(loadSchema('067-reply-translation.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 67 WHERE schema_version < 67;');
+    await exec(loadSchema('067-reply-translation.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 67 WHERE schema_version < 67;');
     // 068：运行端在建会话前拒绝的 spawn 结案为 rejected，屏障可在不记投递的情况下解除。
-    await this.db.query(loadSchema('068-dispatch-attempt-rejected.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 68 WHERE schema_version < 68;');
+    await exec(loadSchema('068-dispatch-attempt-rejected.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 68 WHERE schema_version < 68;');
     // 069：任务卡的“可以用什么”（task.resources），派工正文第二段的来源。
-    await this.db.query(loadSchema('069-task-resources.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 69 WHERE schema_version < 69;');
+    await exec(loadSchema('069-task-resources.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 69 WHERE schema_version < 69;');
     // 070：完工分析表（turn_analysis），只记录与展示。
-    await this.db.query(loadSchema('070-turn-analysis.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 70 WHERE schema_version < 70;');
+    await exec(loadSchema('070-turn-analysis.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 70 WHERE schema_version < 70;');
     // 071：完工分析的失败诊断字段。
-    await this.db.query(loadSchema('071-turn-analysis-diagnostic.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 71 WHERE schema_version < 71;');
+    await exec(loadSchema('071-turn-analysis-diagnostic.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 71 WHERE schema_version < 71;');
     // 072：消息链预排——老板提前给流水线后续步骤的消息做的安排（planned_message）。
-    await this.db.query(loadSchema('072-planned-message.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 72 WHERE schema_version < 72;');
+    await exec(loadSchema('072-planned-message.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 72 WHERE schema_version < 72;');
     // 073：老板风格记忆（owner-style-memory）。
-    await this.db.query(loadSchema('073-owner-style-memory.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 73 WHERE schema_version < 73;');
+    await exec(loadSchema('073-owner-style-memory.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 73 WHERE schema_version < 73;');
     // 074：事件恢复授权（fault_recovery_grant），只记授权，窗口在首次真实尝试时才开始。
-    await this.db.query(loadSchema('074-fault-recovery-grant.surql'));
-    await this.db.query('UPDATE company_meta:installation SET schema_version = 74 WHERE schema_version < 74;');
+    await exec(loadSchema('074-fault-recovery-grant.surql'));
+    await exec('UPDATE company_meta:installation SET schema_version = 74 WHERE schema_version < 74;');
   }
 
   /** Selects the configured namespace/database without touching schema (runtimes that only query). */
