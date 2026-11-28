@@ -1,17 +1,15 @@
 {
-  "version": "0.13.87",
-  "title": "OCI 凭据迁入 sck-vault 钥匙串硬隔离（零落盘私钥）",
+  "version": "0.13.88",
+  "title": "修复公开反馈转发请求体读取异常并登记 SurrealDB 每日离站备份定时器",
   "changes": [
-    "扩展 vault/main.swift（sck-vault）支持 oci provider：老板经 sck-vault setup oci 写入 macOS 登录钥匙串，Keychain ACL 仅绑定签名后的 sck-vault 二进制，磁盘不再保存 OCI 私钥文件。",
-    "sck-vault 新增 op: \"oci\"，用先 unlink 再写入的匿名文件描述符 /dev/fd/3 与 posix_spawn(POSIX_SPAWN_CLOEXEC_DEFAULT) 将私钥传给本机 oci 子进程，执行后由内核自动回收；输出先做 PEM 与密钥双重脱敏并记哈希链审计。",
-    "ops_oci（src/ops/oci.ts、OpsBroker、runner/company.ts）全面改走 VaultClient.oci 经 vault.sock 执行，移除基于磁盘 private/oci/config 的明文配置路径，VaultClient 补齐 not_configured 错误映射。",
-    "员工 Seatbelt 沙箱 scripts/sandbox/employee.sb 新增封禁 ~/.oci 读写，与既有 vault.sock 封禁配合确保员工既读不到密钥也无法绕过工具直连。"
+    "修复 owner-end/src/feedback.ts boundedBody() 在 Bun 1.3.11 异步查策略后读取 createOwnerServer 转发流抛 TypeError 导致公开反馈接口 502 的问题，改为 arrayBuffer() 并保留大小与空正文校验及真实 HTTP 回归测试。",
+    "在 landscape/company-landscape.json 登记 VPS 每日 19:45 UTC SurrealDB 加密离站备份定时器（surrealdb-offsite-backup.timer），并同步 landscape-observe 测试基线。"
   ],
   "impact": [
-    "本机需重编译安装 sck-vault（sh vault/build.sh）并运行 sck-vault setup oci 导入最小权限 OCI API Key，再重启 org.surrealck.vault 即生效；已有 elevenlabs/sync 密钥保持不变。",
-    "员工沙箱禁止读写 ~/.oci；原 private/oci/config 磁盘路径不再使用。",
+    "https://company.maplayer.top/api/feedback/surreal_ck 恢复正常 202 接收与幂等/冲突校验，支撑官网试用申请闭环。",
+    "公司服务全景观测将 surrealdb-offsite-backup.timer 与配套 service 纳入基线，不再产生未登记单元漂移告警。",
     "沿用 schema 074，无数据库迁移。"
   ],
-  "migration": "无 schema 变化（沿用 schema 074）。在宿主机执行 sh vault/build.sh 更新 sck-vault，再运行 sck-vault setup oci 将最小权限 OCI API Key 存入钥匙串并重启 org.surrealck.vault。",
-  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.86；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
+  "migration": "无 schema 变化（沿用 schema 074）。发布作业自动更新老板端云后端与免费边缘 Worker。",
+  "rollback": "执行端启动脚本在新版本连续 3 次启动未确认时自动指回 0.13.87；手工回退见 docs/company-upgrades.md「手动回退到上一版」。"
 }
