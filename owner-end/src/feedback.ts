@@ -9,11 +9,11 @@ import { failureOf } from './errors.ts';
 const MAX_BYTES=32000;
 async function boundedBody(request:Request):Promise<unknown>{
   if(Number(request.headers.get('content-length'))>MAX_BYTES)throw new CompanyError('invalid','反馈内容过大');
-  const reader=request.body?.getReader();if(!reader)throw new CompanyError('invalid','反馈内容不能为空');
-  const parts:Uint8Array[]=[];let bytes=0;
-  try{for(;;){const {done,value}=await reader.read();if(done)break;bytes+=value.byteLength;if(bytes>MAX_BYTES){await reader.cancel();throw new CompanyError('invalid','反馈内容过大');}parts.push(value);}}finally{reader.releaseLock();}
-  const all=new Uint8Array(bytes);let offset=0;for(const part of parts){all.set(part,offset);offset+=part.length;}
-  try{return JSON.parse(new TextDecoder().decode(all));}catch{throw new CompanyError('invalid','反馈格式无效');}
+  // 经 createOwnerServer 转发的 Request 在异步查策略后直接调 body.getReader() 会触发 Bun 1.3.11 异常；arrayBuffer() 走原生读取并保留大小校验。
+  const buffer=await request.arrayBuffer();
+  if(buffer.byteLength===0)throw new CompanyError('invalid','反馈内容不能为空');
+  if(buffer.byteLength>MAX_BYTES)throw new CompanyError('invalid','反馈内容过大');
+  try{return JSON.parse(new TextDecoder().decode(buffer));}catch{throw new CompanyError('invalid','反馈格式无效');}
 }
 export async function handleFeedbackRequest(request:Request,db:Surreal,project:string):Promise<Response>{
   const origin=request.headers.get('origin')??'';
