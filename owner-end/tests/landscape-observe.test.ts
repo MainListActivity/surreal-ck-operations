@@ -21,6 +21,8 @@ redis-server.service loaded active running meeting sfu redis
 livekit.service loaded active running meeting sfu
 livekit-egress.service loaded active running meeting egress
 surrealdb.service loaded active running database
+surrealdb-offsite-backup.service loaded inactive dead daily surrealdb offsite backup
+surrealdb-offsite-backup.timer loaded active waiting daily surrealdb offsite backup timer
 magpie-web.service loaded active running gateway
 caddy.service loaded active running proxy
 tikv-20160.service loaded active running tikv

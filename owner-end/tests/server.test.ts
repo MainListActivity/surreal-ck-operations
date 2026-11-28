@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test';
+import type { Surreal } from 'surrealdb';
 import { createOwnerServer, readServerEnvironment } from '../src/server.ts';
+import { handleFeedbackRequest } from '../src/feedback.ts';
 import { DAILY_CRON, MINUTE_CRON } from '../src/cron.ts';
 import { runServerCron } from '../src/server-cron.ts';
 
@@ -91,6 +93,59 @@ test('真实 HTTP：固定公网 URL，保留登录与 Origin，内部密钥和�
       ...headers, 'x-company-client-ip': 'unknown', 'cf-connecting-ip': '203.0.113.9',
     } });
     expect((await unknown.json()).headers['cf-connecting-ip']).toBeUndefined();
+  } finally { await backend.stop(); }
+});
+
+test('真实 HTTP 反馈转发：异步查策略后仍可完整读取转发请求体并校验空/超长正文', async () => {
+  const feedbackOrigin = 'https://www.maplayer.top';
+  const stored = new Map<string, string>();
+  const fakeDb = {
+    query(sql: string, vars: Record<string, unknown> = {}) {
+      const result = (async () => {
+        if (sql.includes('SELECT policy FROM')) {
+          await Bun.sleep(10);
+          return [[{ policy: JSON.stringify({ enabled: true, feedbackOrigins: [feedbackOrigin], autoRelease: true, releaseInstructions: '', verifyInstructions: '', rollbackInstructions: '' }) }]];
+        }
+        if (sql.includes('SELECT body FROM')) {
+          const body = stored.get(String(vars.id));
+          return [body ? [{ body }] : []];
+        }
+        if (sql.includes('BEGIN TRANSACTION')) {
+          stored.set(String(vars.id), String(vars.body));
+          return [[]];
+        }
+        return [[]];
+      })();
+      return Object.assign(result, { retry: () => result });
+    },
+  } as unknown as Surreal;
+  const backend = createOwnerServer({
+    env: env(), publicOrigin, proxyKey, port: 0,
+    fetch: request => handleFeedbackRequest(request, fakeDb, 'surreal_ck'),
+  });
+  try {
+    const ok = await fetch(new URL('/api/feedback/surreal_ck', backend.server.url), {
+      method: 'POST',
+      headers: { ...headers, origin: feedbackOrigin, 'content-type': 'application/json', 'x-company-client-ip': '198.51.100.7' },
+      body: JSON.stringify({ requestKey: 'server-test-key-001', text: '延迟读取转发请求体回归测试', page: `${feedbackOrigin}/`, version: '1.0.0', contact: '' }),
+    });
+    expect(ok.status).toBe(202);
+    const payload = await ok.json() as { ok: boolean; result: { id: string } };
+    expect(payload.ok).toBe(true);
+    expect(payload.result.id).toMatch(/^[0-9a-f]{64}$/);
+
+    const empty = await fetch(new URL('/api/feedback/surreal_ck', backend.server.url), {
+      method: 'POST',
+      headers: { ...headers, origin: feedbackOrigin, 'content-type': 'application/json' },
+    });
+    expect(empty.status).toBe(400);
+
+    const oversized = await fetch(new URL('/api/feedback/surreal_ck', backend.server.url), {
+      method: 'POST',
+      headers: { ...headers, origin: feedbackOrigin, 'content-type': 'application/json' },
+      body: JSON.stringify({ requestKey: 'server-test-key-002', text: 'x'.repeat(33_000) }),
+    });
+    expect(oversized.status).toBe(400);
   } finally { await backend.stop(); }
 });
 

@@ -311,6 +311,18 @@
       "notes": "生产 SurrealDB：CK 各 workspace 库、_system、platform_content，以及公司库 company/main。红线：不改服务本身、root 凭证和数据目录。 当前版本 4.0.1-native-quota.1+sha.eab8473e4d4e，镜像 ghcr.io/mainlistactivity/surrealdb-native-quota@sha256:e68a34a400c8f8014f1cf1450fd5c4be6ffdf04f73e464d538cc5b9e06ebc66e，rocksdb，2026-11-21 维护运行 44890559131 升级；3.3 镜像与旧数据目录保留作回滚。"
     },
     {
+      "id": "surrealdb-offsite-backup",
+      "repo": "surreal_ck",
+      "host": "vps-data",
+      "kind": "timer",
+      "unit": "surrealdb-offsite-backup.timer",
+      "deploy": "按 surreal_ck docs/runbooks/surrealdb-offsite-backup.md 安装 /usr/local/sbin/sck-surrealdb-daily-backup、/usr/local/sbin/sck-surrealdb-backup-check 与 systemd 单元，每日 19:45 UTC 全量加密备份至 Cloudflare R2 surreal-ck-offsite-backup",
+      "rollback": "停用并禁用 surrealdb-offsite-backup.timer",
+      "status": "active",
+      "verified": true,
+      "notes": "2026-11-27 老板授权启用每日自动全量离站备份（CMS AES-256-GCM，35 天生命周期），配套 surrealdb-offsite-backup.service；健康检查 /usr/local/sbin/sck-surrealdb-backup-check。"
+    },
+    {
       "id": "magpie-web",
       "repo": "magpie",
       "host": "vps-data",
